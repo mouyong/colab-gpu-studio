@@ -1,4 +1,6 @@
 from app.common import APIError, current_user
+from app.db import Store
+from app.gpu.repository import Repository
 from app.history_routes import router
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -38,14 +40,22 @@ class Repo:
         return next((row for row in self.rows.get(kind, []) if row.get("id") == record_id and (owner_id is None or row.get("owner_id") == owner_id)), None)
 
     def list(self, kind, owner_id=None, project_id=None):
+        if kind == "assets":
+            raise ValueError("assets belong to Store, not the GPU Repository")
         return [row for row in self.rows.get(kind, []) if owner_id is None or row.get("owner_id") == owner_id]
+
+
+class AssetStore:
+    def list(self, kind, owner_id=None):
+        assert kind == "assets"
+        return Repo().rows["assets"] if owner_id == "owner" else []
 
 
 def test_history_is_owner_scoped_persisted_only_and_redacts_error_logs():
     app = FastAPI()
     app.add_exception_handler(APIError, api_error_handler)
     app.state.repo = Repo()
-    app.state.store = object()
+    app.state.store = AssetStore()
     app.dependency_overrides[current_user] = lambda: {"id": "owner", "role": "user"}
     app.include_router(router)
 
@@ -74,7 +84,7 @@ def test_history_requires_the_instance_to_belong_to_the_current_owner():
     app = FastAPI()
     app.add_exception_handler(APIError, api_error_handler)
     app.state.repo = Repo()
-    app.state.store = object()
+    app.state.store = AssetStore()
     app.dependency_overrides[current_user] = lambda: {"id": "other", "role": "user"}
     app.include_router(router)
 
@@ -82,3 +92,31 @@ def test_history_requires_the_instance_to_belong_to_the_current_owner():
         response = client.get("/api/gpu/instances/instance-1/history")
 
     assert response.status_code == 404
+
+
+def test_history_with_real_repository_reads_assets_from_store(tmp_path):
+    store = Store(f"sqlite:///{tmp_path / 'history.sqlite'}")
+    repo = Repository(store)
+    repo.create("instances", "owner", {"state": "deleted"}, record_id="instance-real")
+    repo.create("jobs", "owner", {
+        "state": "completed", "instance_id": "instance-real",
+        "output_asset_ids": ["owned-asset", "foreign-asset"],
+    }, record_id="job-real")
+    store.create("assets", "owner", {
+        "filename": "owned.png", "mime": "image/png", "storage_key": "private/owned",
+    }, record_id="owned-asset")
+    store.create("assets", "other", {"filename": "foreign.png"}, record_id="foreign-asset")
+    app = FastAPI()
+    app.add_exception_handler(APIError, api_error_handler)
+    app.state.store = store
+    app.state.repo = repo
+    app.dependency_overrides[current_user] = lambda: {"id": "owner", "role": "user"}
+    app.include_router(router)
+    with TestClient(app) as client:
+        response = client.get("/api/gpu/instances/instance-real/history")
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["offline"] and not data["remote_actions"]
+    assert [a["id"] for a in data["jobs"][0]["artifacts"]] == ["owned-asset"]
+    assert "storage_key" not in response.text
+    assert "foreign.png" not in response.text

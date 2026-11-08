@@ -91,7 +91,8 @@ def instance_history(instance_id: str, request: Request, user=Depends(current_us
     jobs = [row for row in repo.list("jobs", owner) if row.get("instance_id") == instance_id]
     jobs.sort(key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""), reverse=True)
     asset_ids = {asset_id for job in jobs for asset_id in (job.get("output_asset_ids") or []) if isinstance(asset_id, str)}
-    assets = {asset_id: asset for asset_id in asset_ids for asset in repo.list("assets", owner) if asset.get("id") == asset_id}
+    # Assets belong to Store, not the GPU-only Repository; retain owner scoping.
+    assets = {asset["id"]: asset for asset in st.list("assets", owner) if asset.get("id") in asset_ids} if asset_ids else {}
     now = time.time()
     return ok({
         "instance_id": instance_id,
