@@ -124,12 +124,9 @@ def test_orphan_cleanup_refuses_unknown_account_live_lease():
     stale = {"id": "stale", "owner_id": owner, "owner_job_id": "old", "provider": "mock", "instance_id": instance_id, "account_id": "acct", "request_id": "req-stale", "runtime_id": "runtime-stale", "state": "cleanup_pending", "cleanup_next_epoch": 0, "handle": {"runtime_name": "old", "runtime_id": "runtime-stale", "request_id": "req-stale", "job_id": "old", "owner_job_id": "old"}}
     live = {"id": "live", "owner_id": owner, "owner_job_id": "new", "provider": "mock", "instance_id": instance_id, "account_id": None, "request_id": "req-live", "runtime_id": "runtime-live", "state": "active", "handle": {"runtime_name": "live", "runtime_id": "runtime-live", "request_id": "req-live", "job_id": "new", "owner_job_id": "new"}}
 
-    class Repo:
-        def list(self, kind, owner_id=None):
-            return [stale, live] if kind == "leases" else []
-
-        def get(self, *args):
-            return None
+    repo = Repository(Store("sqlite:///:memory:"))
+    for row in (stale, live):
+        repo.create("leases", owner, {k: v for k, v in row.items() if k not in {"id", "owner_id"}}, record_id=row["id"])
 
     class Provider:
         def __init__(self):
@@ -144,9 +141,8 @@ def test_orphan_cleanup_refuses_unknown_account_live_lease():
             return {"deleted": True}
 
     provider = Provider()
-    scheduler = Scheduler(Repo(), provider_factory=lambda _: provider, clock=lambda: 100)
-    scheduler._leases_for = lambda _owner: [stale, live]
-    scheduler._cleanup_orphan_lease(stale)
+    scheduler = Scheduler(repo, provider_factory=lambda _: provider, clock=lambda: 100)
+    scheduler._cleanup_orphan_lease(repo.get("leases", "stale", owner))
     assert provider.calls == []
 
 
@@ -185,21 +181,8 @@ def test_orphan_cleanup_rechecks_same_instance_before_provider_delete():
         "state": "active",
         "handle": {"runtime_id": "runtime-live", "job_id": "new", "owner_job_id": "new"},
     }
-    leases = [stale]
-
-    class Repo:
-        def list(self, kind, owner_id=None):
-            return list(leases) if kind == "leases" else []
-
-        def get(self, *args):
-            return None
-
-        def update(self, kind, record_id, patch, owner_id=None):
-            for row in leases:
-                if row.get("id") == record_id:
-                    row.update(patch)
-                    return row
-            raise KeyError(record_id)
+    repo = Repository(Store("sqlite:///:memory:"))
+    repo.create("leases", owner, {k: v for k, v in stale.items() if k not in {"id", "owner_id"}}, record_id="stale")
 
     class Provider:
         def __init__(self):
@@ -207,7 +190,7 @@ def test_orphan_cleanup_rechecks_same_instance_before_provider_delete():
 
         def inspect(self, handle):
             self.calls.append(("inspect", handle))
-            leases.append(live)
+            repo.create("leases", owner, {k: v for k, v in live.items() if k not in {"id", "owner_id"}}, record_id="live")
             return {"deleted": False}
 
         def delete(self, handle):
@@ -215,10 +198,9 @@ def test_orphan_cleanup_rechecks_same_instance_before_provider_delete():
             return {"deleted": True}
 
     provider = Provider()
-    scheduler = Scheduler(Repo(), provider_factory=lambda _: provider, clock=lambda: 100)
-    scheduler._leases_for = lambda _owner: list(leases)
+    scheduler = Scheduler(repo, provider_factory=lambda _: provider, clock=lambda: 100)
 
-    assert scheduler._cleanup_orphan_lease(stale) is False
+    assert scheduler._cleanup_orphan_lease(repo.get("leases", "stale", owner)) is False
     assert [name for name, _ in provider.calls] == ["inspect"]
 
 
@@ -326,5 +308,9 @@ def test_reconcile_deleted_lease_requires_positive_matching_account_evidence():
         def mark_deleted(self, *args, **kwargs):
             raise AssertionError("must not mark an accountless historical orphan deleted")
     lease = {"id": "lease", "owner_id": "owner", "owner_job_id": "job", "state": "deleted", "account_id": None, "remote_deleted": True, "remote_delete_source": "cleanup_provider_confirmation"}
-    scheduler = Scheduler(object(), instance_service=Service())
+    repo = Repository(Store("sqlite:///:memory:"))
+    repo.create("jobs", "owner", {"state": "completed"}, record_id="job")
+    service = Service()
+    service.list = lambda owner: Service.instances
+    scheduler = Scheduler(repo, instance_service=service)
     assert scheduler._reconcile_deleted_lease_instances([lease]) == 0

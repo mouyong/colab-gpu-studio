@@ -1,6 +1,6 @@
 **English** | [简体中文](README.md)
 
-> Current version: 0.2.10. Fixes new-account authorization failing after OAuth application setup. Also includes Colab CLI compute accounts, independent Drive account binding, and CU reconciliation. See the [0.2.10 release notes](docs/RELEASE_NOTES_0.2.10.md) and [offline implementation notes](docs/OFFLINE_IMPLEMENTATION.md).
+> Current version: 0.3.0. Defensive code cleanup and #24 fixes. See the [0.3.0 release notes](#030-release-notes) below and the [offline implementation notes](docs/OFFLINE_IMPLEMENTATION.md).
 
 # Colab GPU Studio
 
@@ -10,8 +10,8 @@ The frontend is a React single-page app optimized for mobile touch controls, and
 
 ## Downloads and Online Demo
 
-- **Latest version**: [0.2.10 release](https://github.com/TizenryA/colab-gpu-studio/releases/tag/v0.2.10) (source + release notes).
-- **Prebuilt multi-platform bundles**: the [0.2.10 release assets](https://github.com/TizenryA/colab-gpu-studio/releases/tag/v0.2.10) ship Windows x86_64 / Linux x86_64 / macOS x64 / macOS arm64 / Android Termux packages. Desktop bundles include Python and dependencies; Termux installs its native dependencies online at first launch; checksums are in `SHA256SUMS.txt`.
+- **Latest version**: [0.3.0 release](https://github.com/TizenryA/colab-gpu-studio/releases/tag/v0.3.0) (source + release notes).
+- **Prebuilt multi-platform bundles**: the [0.3.0 release assets](https://github.com/TizenryA/colab-gpu-studio/releases/tag/v0.3.0) ship Windows x86_64 / Linux x86_64 / macOS x64 / macOS arm64 / Android Termux packages. Desktop bundles include Python and dependencies; Termux installs its native dependencies online at first launch; checksums are in `SHA256SUMS.txt`.
 - **Read-only UI demo**: [Open the Cloudflare Workers demo](https://gpu-colab-studio-demo.tizenry.tech). Public demo password: `demo-readonly`.
 - The demo uses the **original 0.1.31-dev.8 frontend** with a separate Mock data snapshot. It does not connect to the production site, Google, or a real GPU, and does not consume CU. Generation, uploads, edits, deletion, and authorization are unavailable; download and self-host the full version for complete functionality.
 - [Demo details and more screenshots](docs/DEMO.md). The screenshots below were captured in a real browser on the live demo site; they are not design mockups.
@@ -26,6 +26,41 @@ The frontend is a React single-page app optimized for mobile touch controls, and
 ![Desktop creation page](docs/demo/screenshots/desktop-create.png)
 
 </details>
+
+## 0.3.0 Release Notes
+
+No new features in this release. It does two things: cleans up the code and fixes #24.
+
+**Defensive code cleanup** (about 1270 lines removed, 490 added)
+
+- The scheduler, instance, account, Drive and workbench services talk only to the real data layer; probing, fallback calls and compatibility branches for test doubles are gone.
+- Removed try/except blocks that only swallowed errors, repeated checks, impossible branches and unused options.
+- Authentication, per-user isolation, path checks, secret handling, and error handling around Colab, Drive and subprocess calls are kept.
+
+**#24 fixes** (based on and merged from @CyrusAuyeung's work in #25, thank you)
+
+- The runtime reports the actual GPU via nvidia-smi; jobs, instances and leases record the real model, and the UI shows "actual GPU" and "requested spec" separately.
+- With exactly one authorized Colab account, auto allocation binds that account first; cache prep and Drive sync use the right compute and Drive accounts.
+- Allocation failures distinguish "no GPU available (NO_RUNTIMES)" from other errors, and Google's raw error text is no longer shown.
+- Released or cleaning-up leases are never reallocated; a successful cleanup retry clears the temporary warning and keeps the original failure reason.
+- The Windows coordinator uses a cross-platform file lock, and timestamps always carry a time zone.
+
+**Testing**
+
+- 509 backend and 43 frontend tests pass; type check, production build and contract checks pass.
+- One real CUDA smoke test on a Colab L4: it detected an NVIDIA L4 and the runtime was released after the job.
+- Not yet verified: the Windows file lock has not been tried on a real Windows machine.
+
+Back up the database and `.env` before upgrading; no data migration is needed. Full notes (Chinese): [0.3.0 release notes](docs/RELEASE_NOTES_0.3.0.md).
+
+**Downloads**
+
+- [Colab-GPU-Studio-v0.3.0-windows-x86_64.zip](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.0/Colab-GPU-Studio-v0.3.0-windows-x86_64.zip)
+- [Colab-GPU-Studio-v0.3.0-linux-x86_64.tar.gz](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.0/Colab-GPU-Studio-v0.3.0-linux-x86_64.tar.gz)
+- [Colab-GPU-Studio-v0.3.0-macos-x86_64.tar.gz](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.0/Colab-GPU-Studio-v0.3.0-macos-x86_64.tar.gz)
+- [Colab-GPU-Studio-v0.3.0-macos-arm64.tar.gz](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.0/Colab-GPU-Studio-v0.3.0-macos-arm64.tar.gz)
+- [Colab-GPU-Studio-v0.3.0-android-termux.zip](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.0/Colab-GPU-Studio-v0.3.0-android-termux.zip)
+- [SHA256SUMS.txt](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.0/SHA256SUMS.txt)
 
 ## Why Build This?
 

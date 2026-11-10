@@ -1,6 +1,8 @@
 import type { Provider } from '../lib/gpu-api';
+import { instanceIdentity, instanceMachineLabel, instanceReusable } from '../lib/instance-submission';
 import type { GpuAccount, GpuInstance } from './AccountDirectory';
 import { formatInstanceTime } from '../lib/instance-time';
+import { gpuLabel } from '../lib/gpu-label';
 import styles from './v020.module.css';
 
 export type RuntimeLifecycle = 'save' | 'batch' | 'smart' | 'retain';
@@ -32,7 +34,7 @@ function accountStatus(account: GpuAccount): string {
 }
 
 function instanceId(instance: GpuInstance): string {
-  return instance.id || instance.instance_id || '';
+  return instanceIdentity(instance);
 }
 
 function isAccountSelectable(account: GpuAccount): boolean {
@@ -42,20 +44,19 @@ function isAccountSelectable(account: GpuAccount): boolean {
 
 function instanceLabel(instance: GpuInstance): string {
   const cutoff = instance.hard_deadline_at || instance.idle_deadline_at;
-  return `${instance.instance_label || instance.label || instanceId(instance)} · ${instance.gpu_reported || 'GPU 未确认'} · ${instance.state || '状态未知'}${cutoff ? ` · 截止 ${formatInstanceTime(cutoff)}` : ''}`;
+  return `${instance.instance_label || instance.label || instanceId(instance)} · ${gpuLabel(instance)} · ${instance.state || '状态未知'}${cutoff ? ` · 截止 ${formatInstanceTime(cutoff)}` : ''}`;
 }
 
 export function RuntimeSelection({ value, accounts, instances, provider, onChange }: RuntimeSelectionProps) {
   const selectedAccount = accounts.find((account) => account.account_id === value.accountId);
-  const candidateInstances = instances.filter((instance) => {
-    if (instance.state === 'deleted' || instance.state === 'releasing') return false;
-    if (value.accountId && instance.account_id !== value.accountId) return false;
-    return true;
-  });
+  const sameAccount = instances.filter((instance) => !value.accountId || instance.account_id === value.accountId);
+  const reusableInstances = sameAccount.filter((instance) => instanceReusable(instance));
+  const staleInstance = value.instanceId ? sameAccount.find((instance) => instanceId(instance) === value.instanceId && !instanceReusable(instance)) : undefined;
+  const candidateInstances = staleInstance ? [...reusableInstances, staleInstance] : reusableInstances;
   const selectedInstance = candidateInstances.find((instance) => instanceId(instance) === value.instanceId);
   const hasAccounts = accounts.some(isAccountSelectable);
   const accountReason = !accounts.length ? '尚未加载账号。' : !hasAccounts ? '没有已连接且允许分配的账号；请先在设置中的账号目录完成授权。' : '';
-  const instanceReason = value.instanceId && !selectedInstance ? '所选实例不可用、已释放或不属于当前账号。' : '';
+  const instanceReason = value.instanceId && (!selectedInstance || !instanceReusable(selectedInstance)) ? '所选机器已释放或不能复用。提交前会停下来，不会静默改用其他账号。' : '';
 
   function update(patch: Partial<RuntimeSelectionValue>) {
     onChange({ ...value, ...patch });
@@ -85,7 +86,7 @@ export function RuntimeSelection({ value, accounts, instances, provider, onChang
           <label htmlFor="runtime-instance">机器
             <select id="runtime-instance" value={value.instanceId || ''} onChange={(event) => update({ instanceId: event.target.value || null })} disabled={(!candidateInstances.length && Boolean(value.accountId))}>
               <option value="">自动分配兼容机器</option>
-              {candidateInstances.map((instance) => <option key={instanceId(instance)} value={instanceId(instance)}>{instanceLabel(instance)}</option>)}
+              {candidateInstances.map((instance) => <option key={instanceId(instance)} value={instanceId(instance)} disabled={!instanceReusable(instance)}>{instanceReusable(instance) ? instanceLabel(instance) : `${instanceMachineLabel(instance)} · 不能复用`}</option>)}
             </select>
           </label>
           {selectedAccount && <span className={styles.selectionHint}>当前账号：{selectedAccount.alias}。指定机器时不会静默切换到其他账号。</span>}

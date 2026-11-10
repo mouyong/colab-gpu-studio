@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  acceptGpuWorkflowSmoke, apiMessage, getGpuComputeSpecs, getGoogleAccounts, getProjects, getWorkflowActivation,
-  publishGpuWorkflow, realSmokeGpuWorkflow, reviewGpuModel, reviewGpuWorkflow, validateGpuWorkflow, getGpuJob,
-  type ComputeSpec, type GpuWorkflow, type WorkflowActivation,
+  acceptGpuWorkflowSmoke, apiMessage, getGpuComputeSpecs, getGoogleAccounts, getReferenceAssets, getWorkflowActivation,
+  publishGpuWorkflow, realSmokeGpuWorkflow, reviewGpuModel, reviewGpuWorkflow, uploadAsset, validateGpuWorkflow, getGpuJob,
+  type ActivationInput, type ComputeSpec, type GalleryAsset, type GpuWorkflow, type WorkflowActivation,
 } from '../lib/gpu-api';
 import {
-  appendActivationLog, getActivationStep, getSmokeRuntimeMinutes, hasExistingSmoke,
-  isSmokeCompleted, isSmokePolling, shouldAcceptSmoke, shouldCreateSmoke, terminalSmokeJobId,
+  activationSmokeParams, appendActivationLog, getActivationStep, getSmokeRuntimeMinutes, hasExistingSmoke,
+  isSmokeCompleted, isSmokePolling, missingActivationInputs, shouldAcceptSmoke, shouldCreateSmoke, smokeIdempotencyKey,
+  terminalSmokeJobId, type ActivationWatch,
 } from '../lib/activation-resume';
 import { resolveGpuCheckRequest, selectEligibleColabGpuSpec } from '../lib/colab-check';
 import styles from '../gpu.module.css';
@@ -22,21 +23,26 @@ function runtimeText(minutes: number | null): string {
   return `服务端运行上限 ${value} 分钟`;
 }
 
-function smokeStateText(state: string): string {
-  if (state === 'queued' || state === 'pending') return '冒烟任务已恢复，正在排队';
-  if (state === 'running') return '冒烟任务已恢复，正在运行';
+function smokeStateText(state: string, minutes: number | null): string {
+  const limit = minutes === null ? '' : `，最长 ${Number.isInteger(minutes) ? minutes : minutes.toFixed(1)} 分钟`;
+  if (state === 'queued' || state === 'pending') return `冒烟任务已在队列中${limit}`;
+  if (state === 'running') return `冒烟任务正在运行${limit}`;
   if (state === 'completed' || state === 'succeeded' || state === 'success') return '冒烟任务已完成，可直接验收';
   return `冒烟任务状态：${state}`;
 }
 
 export function WorkflowActivationPanel({
-  workflow, onClose, onDone, onPreview, onOpenJob,
+  workflow, projectId, projectTitle, onClose, onDone, onPreview, onOpenJob, onUseProject, onWatch,
 }: {
   workflow: GpuWorkflow;
+  projectId: string;
+  projectTitle: string;
   onClose: () => void;
   onDone: () => void;
   onPreview?: () => void;
-  onOpenJob?: (jobId: string) => void;
+  onOpenJob?: (jobId: string, projectId?: string) => void;
+  onUseProject?: (projectId: string) => void;
+  onWatch?: (watch: ActivationWatch | null) => void;
 }) {
   const [data, setData] = useState<WorkflowActivation | null>(null);
   const [history, setHistory] = useState<JobHistoryDetailRecord | null>(null);
@@ -46,12 +52,18 @@ export function WorkflowActivationPanel({
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [consent, setConsent] = useState(false);
-  const [projectId, setProjectId] = useState('');
   const [accountId, setAccountId] = useState('');
   const [spec, setSpec] = useState<ComputeSpec | null>(null);
   const [specsLoaded, setSpecsLoaded] = useState(false);
+  const [inputs, setInputs] = useState<Record<string, string>>({});
+  const [assets, setAssets] = useState<GalleryAsset[]>([]);
+  const [uploading, setUploading] = useState('');
   const aliveRef = useRef(false);
   const executionRef = useRef(0);
+  const runningRef = useRef(false);
+  const fileRefs = useRef<Record<string, HTMLInputElement | null>>({});
+  const onWatchRef = useRef(onWatch);
+  onWatchRef.current = onWatch;
 
   const isCurrent = useCallback((token: number) => aliveRef.current && executionRef.current === token, []);
 
@@ -62,7 +74,6 @@ export function WorkflowActivationPanel({
 
   const refresh = useCallback(async (token: number): Promise<WorkflowActivation> => {
     const next = await getWorkflowActivation(workflow.id);
-    // The server snapshot is authoritative, but never update a closed or replaced panel.
     if (isCurrent(token)) setData(next);
     return next;
   }, [isCurrent, workflow.id]);
@@ -73,16 +84,16 @@ export function WorkflowActivationPanel({
   ): Promise<WorkflowActivation | null> => {
     let snapshot = initial;
     let announcedState = '';
+    const minutes = getSmokeRuntimeMinutes(snapshot);
     while (isCurrent(token)) {
       const state = String(snapshot.smoke?.state || '').toLowerCase();
       if (state && state !== announcedState) {
         announcedState = state;
-        say(smokeStateText(state), token);
+        say(smokeStateText(state, minutes), token);
       }
       if (isSmokeCompleted(snapshot) || ['failed', 'cancelled', 'canceled', 'error'].includes(state)) {
         return snapshot;
       }
-      // Do not emit a log entry for every poll. The service snapshot remains visible in the steps.
       await sleep(STEPS_POLL_MS);
       if (!isCurrent(token)) return null;
       snapshot = await refresh(token);
@@ -92,7 +103,8 @@ export function WorkflowActivationPanel({
   }, [isCurrent, refresh, say]);
 
   const runAll = useCallback(async () => {
-    if (busy || !aliveRef.current) return;
+    if (runningRef.current || busy || !aliveRef.current) return;
+    runningRef.current = true;
     const token = executionRef.current + 1;
     executionRef.current = token;
     setError('');
@@ -101,8 +113,6 @@ export function WorkflowActivationPanel({
       let snapshot = await refresh(token);
       if (!isCurrent(token)) return;
 
-      // Existing queued/running/completed jobs are authoritative. In particular,
-      // do not make account/spec discovery a prerequisite for accepting one.
       if (shouldCreateSmoke(snapshot) && snapshot.blockers.length) {
         throw new Error(snapshot.blockers[0]);
       }
@@ -111,7 +121,7 @@ export function WorkflowActivationPanel({
         await validateGpuWorkflow(workflow.id);
         if (!isCurrent(token)) return;
         snapshot = await refresh(token);
-          if (!isCurrent(token)) return;
+        if (!isCurrent(token)) return;
       }
       if (getActivationStep(snapshot, 'model_review')?.done !== true) {
         if (!snapshot.model) throw new Error('找不到绑定的模型记录');
@@ -119,40 +129,45 @@ export function WorkflowActivationPanel({
         await reviewGpuModel(snapshot.model.model_id);
         if (!isCurrent(token)) return;
         snapshot = await refresh(token);
-          if (!isCurrent(token)) return;
+        if (!isCurrent(token)) return;
       }
       if (getActivationStep(snapshot, 'workflow_review')?.done !== true) {
         say('正在锁定权重与节点…', token);
         await reviewGpuWorkflow(workflow.id);
         if (!isCurrent(token)) return;
         snapshot = await refresh(token);
-          if (!isCurrent(token)) return;
+        if (!isCurrent(token)) return;
       }
 
       if (getActivationStep(snapshot, 'real_smoke')?.done !== true) {
         if (hasExistingSmoke(snapshot)) {
-          say('发现已有冒烟任务，继续读取服务端进度…', token);
+          say('发现已有冒烟任务，继续读取服务端进度，不会重新提交。', token);
           if (!isSmokeCompleted(snapshot)) {
             const resumed = await waitForSmoke(snapshot, token);
             if (!resumed) return;
             snapshot = resumed;
           }
         } else {
+          const required = snapshot.required_inputs || [];
+          const missing = missingActivationInputs(required, inputs);
+          if (missing.length) throw new Error(`请先上传：${missing.join('、')}`);
           if (!consent) throw new Error('请先确认会真实开 GPU 并产生费用');
-          if (!projectId) throw new Error('请先创建一个项目，冒烟任务要落在项目里');
+          if (!projectId) throw new Error('请先在顶栏选择项目。冒烟只会记在当前项目里，不会自动改用别的项目。');
           if (!accountId || !spec) throw new Error('当前账号没有可用的 GPU 规格，请先授权 Colab');
-          say('正在提交真实 GPU 冒烟…', token);
+          const minutes = getSmokeRuntimeMinutes(snapshot);
+          say(minutes === null ? '正在提交真实 GPU 冒烟…' : `正在提交真实 GPU 冒烟，最长 ${Number.isInteger(minutes) ? minutes : minutes.toFixed(1)} 分钟`, token);
+          const smokeBody = activationSmokeParams(required, inputs);
           await realSmokeGpuWorkflow(
             workflow.id,
             {
               confirmed: true,
               project_id: projectId,
-              params: {},
-              asset_ids: [],
+              params: smokeBody.params,
+              asset_ids: smokeBody.assetIds,
               account_id: accountId,
               spec,
             },
-            `smoke-${workflow.id}-${Date.now()}`,
+            smokeIdempotencyKey(workflow.id, projectId, smokeBody.assetIds),
           );
           if (!isCurrent(token)) return;
           snapshot = await refresh(token);
@@ -185,9 +200,10 @@ export function WorkflowActivationPanel({
     } catch (err) {
       if (isCurrent(token)) setError(apiMessage(err));
     } finally {
+      runningRef.current = false;
       if (isCurrent(token)) setBusy(false);
     }
-  }, [accountId, busy, consent, isCurrent, onDone, projectId, refresh, say, spec, waitForSmoke, workflow.id]);
+  }, [accountId, busy, consent, inputs, isCurrent, onDone, projectId, refresh, say, spec, waitForSmoke, workflow.id]);
 
   useEffect(() => {
     aliveRef.current = true;
@@ -200,7 +216,6 @@ export function WorkflowActivationPanel({
         if (hasExistingSmoke(snapshot)) {
           setSpecsLoaded(true);
           if (isSmokePolling(snapshot)) {
-            // Initial mount polling owns the continuation until it settles.
             setBusy(true);
             say('已恢复服务端冒烟进度…', token);
             try { await waitForSmoke(snapshot, token); }
@@ -210,9 +225,8 @@ export function WorkflowActivationPanel({
           }
           return;
         }
-        const [projects, accounts] = await Promise.all([getProjects(), getGoogleAccounts()]);
+        const accounts = await getGoogleAccounts();
         if (!isCurrent(token)) return;
-        setProjectId(projects[0]?.id || '');
         const request = resolveGpuCheckRequest(
           { real_enabled: snapshot.real_enabled, offline_mode: false },
           accounts,
@@ -224,7 +238,6 @@ export function WorkflowActivationPanel({
         const eligible = selectEligibleColabGpuSpec(await getGpuComputeSpecs('colab', request.accountId));
         if (!isCurrent(token)) return;
         if (!eligible) throw new Error('当前账号没有可用的真实 GPU 规格（已过滤 CPU/TPU）');
-        // Keep the account identity and structured spec from the same discovery call.
         setAccountId(request.accountId);
         setSpec(eligible);
       } catch (err) {
@@ -236,23 +249,118 @@ export function WorkflowActivationPanel({
     void load();
     return () => {
       aliveRef.current = false;
-      // This only stops local continuation/polling. It deliberately does not cancel the remote job.
       executionRef.current += 1;
     };
   }, [isCurrent, refresh, say, waitForSmoke]);
 
+  useEffect(() => {
+    if (!projectId) {
+      setAssets([]);
+      return;
+    }
+    let alive = true;
+    getReferenceAssets(projectId).then((rows) => {
+      if (alive) setAssets(rows.filter((asset) => String(asset.mime || '').startsWith('image/')));
+    }).catch(() => undefined);
+    return () => { alive = false; };
+  }, [projectId]);
+
+  useEffect(() => {
+    const notify = onWatchRef.current;
+    if (!notify) return;
+    const smoke = data?.smoke;
+    if (!smoke?.job_id) {
+      notify(null);
+      return;
+    }
+    notify({
+      workflowId: workflow.id,
+      projectId: smoke.project_id || projectId,
+      jobId: smoke.job_id,
+      state: String(smoke.state || ''),
+      maxRuntimeMinutes: getSmokeRuntimeMinutes(data),
+    });
+  }, [data, projectId, workflow.id]);
+
   const existingSmoke = hasExistingSmoke(data);
   const needsNewSmoke = data ? !data.done && shouldCreateSmoke(data) : true;
   const runtimeLimit = getSmokeRuntimeMinutes(data);
+  const requiredInputs = data?.required_inputs || [];
+  const missing = missingActivationInputs(requiredInputs, inputs);
+  const smokeProjectId = data?.smoke?.project_id || '';
+  const smokeElsewhere = Boolean(existingSmoke && smokeProjectId && projectId && smokeProjectId !== projectId);
+
+  async function uploadFor(input: ActivationInput, file: File) {
+    if (!projectId) {
+      setError('请先在顶栏选择项目，再上传图片。');
+      return;
+    }
+    setUploading(input.key);
+    setError('');
+    try {
+      const asset = await uploadAsset(projectId, file);
+      setAssets((current) => [asset, ...current.filter((item) => item.id !== asset.id)]);
+      setInputs((current) => ({ ...current, [input.key]: asset.id }));
+    } catch (err) {
+      setError(apiMessage(err));
+    } finally {
+      setUploading('');
+    }
+  }
 
   return (
     <div className={styles.activationPanel}>
       <p className="muted small">
-        这一步会真实分配 GPU 跑一次冒烟（{runtimeText(runtimeLimit)}，按实际用量计费）。通过后自动发布并设为当前版本。
+        这一步会真实分配 GPU 跑一次冒烟（{runtimeText(runtimeLimit)}，按实际用量计费）。通过后自动发布并设为当前版本。发布是单独的一步，不会在冒烟排队时一直空转。
       </p>
+      <p className="muted small">
+        {projectId
+          ? `新的冒烟任务记在当前项目「${projectTitle || '当前项目'}」里，可以在这个项目的任务页看到。`
+          : '还没有选中项目。请先用顶栏切换到要归档这次启用的项目，不会自动改用列表里的第一个项目。'}
+      </p>
+      {smokeElsewhere ? (
+        <div className={styles.notice}>
+          <p className="small">已有冒烟任务记在另一个项目里，所以当前项目的任务页看不到它。继续验收不会再提交一次。</p>
+          {onUseProject ? <button className="button secondary small" type="button" onClick={() => onUseProject(smokeProjectId)}>打开那个项目的任务</button> : null}
+        </div>
+      ) : null}
       {data?.blockers.length && !existingSmoke ? (
         <div className={styles.notice}>
           {data.blockers.map((item) => <p key={item} className="small">{item}</p>)}
+        </div>
+      ) : null}
+      {needsNewSmoke && requiredInputs.length ? (
+        <div className={styles.stack}>
+          <p className="small">这个工作流的冒烟需要图片。没有填必填项时不会提交，也不会跳过校验。</p>
+          {requiredInputs.map((input) => (
+            <div className={styles.paramField} key={input.key}>
+              <div className={styles.paramLabel}>
+                <label htmlFor={`activation-${input.key}`}>{input.label}{input.required ? '（必填）' : '（可选）'}</label>
+              </div>
+              <div className={styles.fileControl}>
+                <select id={`activation-${input.key}`} value={inputs[input.key] || ''} onChange={(event) => setInputs((current) => ({ ...current, [input.key]: event.target.value }))}>
+                  <option value="">{input.required ? '请选择或上传图片' : '不使用'}</option>
+                  {assets.map((asset) => <option key={asset.id} value={asset.id}>{asset.filename || asset.id}</option>)}
+                </select>
+                <button className="button secondary small" type="button" disabled={uploading === input.key} onClick={() => fileRefs.current[input.key]?.click()}>
+                  {uploading === input.key ? '上传中…' : '上传'}
+                </button>
+                <input
+                  ref={(node) => { fileRefs.current[input.key] = node; }}
+                  hidden
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp"
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    if (file) void uploadFor(input, file);
+                    event.target.value = '';
+                  }}
+                />
+              </div>
+              {input.description ? <span className={styles.hint}>{input.description}</span> : null}
+            </div>
+          ))}
+          {missing.length ? <p className={styles.errorText}>还缺：{missing.join('、')}</p> : null}
         </div>
       ) : null}
       <ol className={styles.activationSteps}>
@@ -260,7 +368,7 @@ export function WorkflowActivationPanel({
           <li key={step.key} data-state={step.done ? 'done' : step.failed ? 'failed' : step.running ? 'running' : step.next ? 'next' : 'todo'}>
             <span>{step.label}</span>
             <span className="pill" data-state={step.done ? 'active' : undefined}>
-              {step.done ? '已完成' : step.failed ? '失败' : step.running ? '进行中' : step.next ? '待执行' : '待执行'}
+              {step.done ? '已完成' : step.failed ? '失败' : step.running ? '进行中' : '待执行'}
             </span>
           </li>
         ))}
@@ -286,7 +394,7 @@ export function WorkflowActivationPanel({
         {terminalSmokeJobId(data) ? <button className="button secondary" type="button" disabled={historyBusy} onClick={() => {
           const jobId = terminalSmokeJobId(data);
           if (!jobId) return;
-          if (onOpenJob) { onOpenJob(jobId); return; }
+          if (onOpenJob) { onOpenJob(jobId, smokeProjectId || projectId); return; }
           const token = executionRef.current;
           setHistoryError('');
           setHistoryBusy(true);
@@ -298,7 +406,7 @@ export function WorkflowActivationPanel({
         <button
           className="button"
           type="button"
-          disabled={busy || !specsLoaded || (needsNewSmoke && !consent)}
+          disabled={busy || !specsLoaded || (needsNewSmoke && (!consent || missing.length > 0 || !projectId))}
           onClick={() => void runAll()}
         >
           {busy ? '执行中…' : data?.done ? '重新检查' : existingSmoke ? '继续验收并启用' : '一键跑通并启用'}

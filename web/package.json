@@ -1,13 +1,13 @@
 {
   "name": "colab-gpu-studio-web",
   "private": true,
-  "version": "0.2.15",
+  "version": "0.3.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
     "typecheck": "tsc -b --pretty false",
-    "test:contract": "node scripts/gpu-contract-check.mjs",
+    "test:contract": "node scripts/gpu-contract-check.mjs && node scripts/gpu-diagnostics-check.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

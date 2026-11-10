@@ -17,6 +17,13 @@ class LedgerInstanceService:
         self.segments = {}
         self._next = 0
 
+    def list(self, owner):
+        return [dict(row) for row in self.instances.values()]
+
+    def get(self, owner, instance_id):
+        row = self.instances.get(instance_id)
+        return dict(row) if row else None
+
     def allocate(self, job):
         self._next += 1
         instance = {
@@ -54,7 +61,7 @@ class LedgerInstanceService:
             instance["idle_deadline_at"] = self.clock() + 120
         return dict(instance)
 
-    def mark_deleted(self, owner, instance_id, remote_deleted=False):
+    def mark_deleted(self, owner, instance_id, expected_version=None, remote_deleted=False):
         assert remote_deleted is True
         instance = self.instances[instance_id]
         instance["state"] = "deleted"

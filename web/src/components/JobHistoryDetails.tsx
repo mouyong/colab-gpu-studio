@@ -31,7 +31,7 @@ export function JobHistoryDetails({ job }: { job: JobHistoryDetailRecord }) {
                 </div>
               ))}
             </dl>
-            <p className="muted small">各阶段独立计时，可能存在重叠，不代表总用时。</p>
+            <p className="muted small">单位是秒，按服务端墙钟记录。各阶段独立计时，可能重叠，相加不是工作流发布又等待的时间。</p>
           </div>
         </details>
       ) : null}

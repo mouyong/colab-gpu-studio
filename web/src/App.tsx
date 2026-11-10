@@ -3,7 +3,7 @@ import { GalleryPanel } from './pages/GalleryPage';
 import { TasksPanel } from './pages/JobsPage';
 import { CreatePanel } from './pages/CreatePage';
 import { ComputePage, ThemePicker } from './pages/ComputePage';
-import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Sparkles, Zap, Image as ImageIcon, Cpu, Settings as SettingsIcon, Folder, ChevronDown, X, Plus, Check, Maximize2, Star, Download, Trash2, RotateCcw, Triangle } from 'lucide-react';
 import {
   apiMessage, assetUrl, cancelGpuJob, createGpuJob, createGpuBatch, createProject, deleteAsset, disconnectGoogle,
@@ -11,8 +11,8 @@ import {
   getGpuComputeSpecs, getGpuGallery, getGpuJob, getGpuJobs, getGpuModels, listGpuInstances,
   getGpuPresets, getReferenceAssets, getGpuSettings, getGpuUsage, getGpuWorkflowSchema, getGpuWorkflows, getProjects, importGpuWorkflow,
   isLoggedIn, login, publishGpuWorkflow, retryGpuJob, retryGpuAttempt, startGoogleAuth, stopGpuCompute, updateAsset, uploadAsset,
-  validateGpuWorkflow, rollbackGpuWorkflow, saveGpuPreset, type ComputeSpec, type GalleryAsset, type GpuJob, type GpuPreset,
-  type GpuManifest, type GpuModel, type GpuParameter, type GpuSettings, type GpuUsage, type GpuWorkflow, type Project, type Provider,
+  validateGpuWorkflow, rollbackGpuWorkflow, deactivateGpuWorkflow, saveGpuPreset, ApiError, type ComputeSpec, type GalleryAsset, type GpuJob, type GpuPreset,
+  type GpuManifest, type GpuModel, type GpuSettings, type GpuUsage, type GpuWorkflow, type Project, type Provider,
 } from './lib/gpu-api';
 import type { GpuAccount, GpuInstance } from './components/AccountDirectory';
 import type { RuntimeChoice } from './pages/CreatePage';
@@ -22,6 +22,10 @@ import { GoogleOAuthSetup } from './components/GoogleOAuthSetup';
 import { ComputeSpecs } from './components/ComputeSpecs';
 import { resolveGpuCheckRequest } from './lib/colab-check';
 import { jobStateLabel } from './lib/job-stage-rows';
+import { jobDetailTimings, paramRows, stageSecondsTotal, taskStatusNote } from './lib/job-detail-copy';
+import { resolveInstanceSubmission } from './lib/instance-submission';
+import { projectOptionLabel } from './lib/project-label';
+import { carriedDraft, mergeWorkflowDraft, readWorkflowDraft, writeWorkflowDraft } from './lib/workflow-draft';
 import { formatInstanceTime } from './lib/instance-time';
 import { JobHistoryDetails } from './components/JobHistoryDetails';
 import styles from './gpu.module.css';
@@ -46,34 +50,6 @@ function uniqueBy<T>(items: T[], keyOf: (item: T) => string): T[] {
 
 function instanceIdOf(instance: Pick<GpuInstance, 'id' | 'instance_id'>): string {
   return instance.id || instance.instance_id || '';
-}
-
-function parameterList(manifest: GpuManifest | null): GpuParameter[] {
-  if (!manifest?.parameters) return [];
-  if (Array.isArray(manifest.parameters)) return manifest.parameters;
-  return Object.entries(manifest.parameters).map(([key, item]) => {
-    const normalized = item as GpuParameter;
-    return { ...normalized, key, id: normalized.id || key };
-  });
-}
-
-function parameterKey(item: GpuParameter, index: number) {
-  return item.key || item.id || item.name || `parameter_${index + 1}`;
-}
-
-function defaultParams(manifest: GpuManifest | null) {
-  return Object.fromEntries(
-    parameterList(manifest).map((item, index) => [
-      parameterKey(item, index),
-      item.default !== undefined
-        ? item.default
-        : item.type === 'boolean'
-        ? false
-        : item.type === 'integer' || item.type === 'number'
-        ? item.min ?? 0
-        : '',
-    ])
-  );
 }
 
 function keyId() {
@@ -178,7 +154,7 @@ function ProjectSheet({
                 aria-current={p.id === projectId ? 'true' : undefined}
                 onClick={() => { onSelect(p.id); onClose(); }}
               >
-                <span>{p.title}</span>
+                <span>{projectOptionLabel(p, projects)}</span>
                 {p.id === projectId && <Check size={16} strokeWidth={1.8} aria-label="当前项目" />}
               </button>
             </li>
@@ -287,6 +263,12 @@ export default function App() {
   const instanceRetentionKeys = useRef<Record<string, string>>({});
   const jobSequence = useRef(0);
   const draftReady = useRef('');
+  const paramsRef = useRef(params);
+  paramsRef.current = params;
+  const workflowIdRef = useRef(workflowId);
+  workflowIdRef.current = workflowId;
+  const incomingDraft = useRef<Record<string, unknown> | null>(null);
+  const draftLocation = useRef({ projectId: '', workflowId: '' });
 
   const activeProject = projects.find((p) => p.id === projectId);
   const activeWorkflow = workflows.find((item) => item.id === workflowId);
@@ -373,36 +355,44 @@ export default function App() {
   useEffect(() => {
     if (!modelId) return;
     const allowed = workflows.filter((w) => w.model_id === modelId);
-    if (!allowed.some((w) => w.id === workflowId)) {
+    if (workflowId && !allowed.some((w) => w.id === workflowId)) {
+      if (projectId && draftReady.current === `${projectId}:${workflowId}`) writeWorkflowDraft(projectId, workflowId, paramsRef.current);
+      draftReady.current = '';
       setWorkflowId('');
       setManifest(null);
       setParams({});
     }
-  }, [modelId, workflows, workflowId]);
+  }, [modelId, workflows, workflowId, projectId]);
 
   useEffect(() => {
-    if (!workflowId) return;
+    if (!workflowId || !projectId) return;
+    const previous = draftLocation.current;
+    const sameProject = previous.projectId === projectId;
+    if (previous.workflowId && previous.projectId && draftReady.current === `${previous.projectId}:${previous.workflowId}`) {
+      writeWorkflowDraft(previous.projectId, previous.workflowId, paramsRef.current);
+    }
+    const carried = sameProject && previous.workflowId && previous.workflowId !== workflowId ? carriedDraft(paramsRef.current) : null;
+    draftLocation.current = { projectId, workflowId };
     let alive = true;
+    const requestWorkflow = workflowId;
+    const requestProject = projectId;
     setLoading('schema');
     getGpuWorkflowSchema(workflowId).then((next) => {
-      if (alive) {
-        setManifest(next);
-        let saved:Record<string,unknown> = {};
-        try {
-          const raw=sessionStorage.getItem(`studio-draft:${projectId}:${workflowId}`);
-          if(raw) saved=JSON.parse(raw);
-        } catch { /* unavailable browser storage keeps defaults */ }
-        draftReady.current=`${projectId}:${workflowId}`;
-        setParams({...defaultParams(next),...saved});
-      }
+      if (!alive) return;
+      const forced = incomingDraft.current;
+      incomingDraft.current = null;
+      const saved = forced ?? readWorkflowDraft(requestProject, requestWorkflow);
+      setManifest(next);
+      draftReady.current = `${requestProject}:${requestWorkflow}`;
+      setParams(mergeWorkflowDraft(next, saved, forced ? null : carried));
     }).catch((cause) => alive && setError(`参数 schema：${apiMessage(cause)}`)).finally(() => alive && setLoading(''));
     return () => { alive = false; };
-  }, [workflowId,projectId]);
+  }, [workflowId, projectId]);
 
-  useEffect(()=>{
-    if(draftReady.current!==`${projectId}:${workflowId}` || !workflowId || !projectId) return;
-    try {sessionStorage.setItem(`studio-draft:${projectId}:${workflowId}`,JSON.stringify(params));} catch { /* storage full */ }
-  },[params,projectId,workflowId]);
+  useEffect(() => {
+    if (draftReady.current !== `${projectId}:${workflowId}` || !workflowId || !projectId) return;
+    writeWorkflowDraft(projectId, workflowId, params);
+  }, [params, projectId, workflowId]);
 
   useEffect(() => {
     if (!projectId || !loggedIn) return;
@@ -458,10 +448,12 @@ export default function App() {
 
   useEffect(() => {
     if (againJob && (againJob.resolved_params || againJob.params)) {
+      const restored = { ...(againJob.resolved_params || againJob.params) };
       setModelId(String(againJob.model_id || ''));
       const workflow = workflows.find((item) => item.workflow_key === againJob.workflow_key && String(item.workflow_version) === String(againJob.workflow_version));
+      if (workflow && workflow.id !== workflowIdRef.current) incomingDraft.current = restored;
       if (workflow) setWorkflowId(workflow.id);
-      setParams({ ...(againJob.resolved_params || againJob.params) });
+      setParams(restored);
       setAgainJob(null);
       setTab('创作');
     }
@@ -526,6 +518,12 @@ export default function App() {
     setLoading('submit');
     setError('');
     try {
+      const decision = resolveInstanceSubmission(runtimeChoice, instances);
+      if (!decision.ok) {
+        setRuntimeChoice({ ...runtimeChoice, accountId: decision.accountId, instanceId: decision.instanceId });
+        setError(decision.message);
+        return;
+      }
       const validAssetIds = new Set(referenceAssets(referenceImages).filter((a) => a.project_id === projectId).map((a) => a.id));
       const body = {
         project_id: projectId,
@@ -539,9 +537,9 @@ export default function App() {
         execution_policy: {
           provider: runtime,
           max_runtime_minutes: maxRuntime,
-          allocation: runtimeChoice.instanceId ? 'existing' as const : 'auto' as const,
-          account_id: runtimeChoice.accountId || null,
-          instance_id: runtimeChoice.instanceId || null,
+          allocation: decision.allocation,
+          account_id: decision.accountId,
+          instance_id: decision.instanceId,
           lifecycle: runtimeChoice.lifecycle,
           retain_idle_minutes: runtimeChoice.retainIdleMinutes,
         },
@@ -559,7 +557,16 @@ export default function App() {
       idempotencyKey.current = '';
       await refreshJobs();
     } catch (cause) {
-      setError(`提交任务：${apiMessage(cause)}`);
+      const code = cause instanceof ApiError ? cause.code : '';
+      if (code === 'INSTANCE_UNAVAILABLE' || code === 'INSTANCE_NOT_FOUND') {
+        const decision = resolveInstanceSubmission(runtimeChoice, instances);
+        setRuntimeChoice({ ...runtimeChoice, accountId: decision.accountId || runtimeChoice.accountId, instanceId: null });
+        setError('所选 GPU 机器已释放或不能复用。这次没有提交任务，也没有换账号。请再点一次确认，改为自动分配，或另选一台可用机器。');
+      } else if (code === 'NETWORK_TIMEOUT') {
+        setError(`提交任务：${apiMessage(cause)}。网络中断时请先到「任务」页确认是否已经提交，不要连续改参数重试。`);
+      } else {
+        setError(`提交任务：${apiMessage(cause)}。这次没有确认任务已创建。`);
+      }
     } finally {
       submitting.current = false;
       setLoading('');
@@ -761,7 +768,7 @@ export default function App() {
         <div className="topbarActions">
           <button className="projectChip" type="button" aria-label="切换项目" onClick={() => setShowProjectSheet(true)}>
             <Folder size={15} strokeWidth={1.6} aria-hidden />
-            <span>{activeProject ? activeProject.title : '选择项目'}</span>
+            <span>{activeProject ? projectOptionLabel(activeProject, projects) : '选择项目'}</span>
             <ChevronDown size={14} strokeWidth={1.6} aria-hidden />
           </button>
           <button className="iconButton" type="button" aria-label="新建项目" title="新建项目" onClick={() => setShowNewProject(true)}>
@@ -923,6 +930,18 @@ export default function App() {
               await rollbackGpuWorkflow(wf.workflow_key, wf.workflow_version);
               setWorkflows(await getGpuWorkflows());
             })}
+            onDeactivate={(wf) => void action('deactivate', async () => {
+              await deactivateGpuWorkflow(wf.id);
+              setWorkflows(await getGpuWorkflows());
+            })}
+            projectId={projectId}
+            projectTitle={activeProject ? projectOptionLabel(activeProject, projects) : ''}
+            onOpenJob={(jobId, jobProjectId) => {
+              if (jobProjectId) chooseProject(jobProjectId);
+              setTab('任务');
+              void getGpuJob(jobId).then(setDetail).catch((cause) => setError(apiMessage(cause)));
+            }}
+            onUseProject={(id) => { chooseProject(id); setTab('任务'); }}
             onActivated={() => { void getGpuWorkflows().then(setWorkflows); void getGpuModels().then(setModels).catch(() => undefined); }}
             onLogout={() => {
               sessionStorage.removeItem('colab-gpu-studio-token');
@@ -947,10 +966,11 @@ export default function App() {
             <dl className={styles.kv}>
               <dt>工作流</dt><dd>{activeWorkflow.workflow_key} · v{activeWorkflow.workflow_version}</dd>
               <dt>运行方式</dt><dd>{runtime === 'colab' ? 'Colab GPU（会扣 CU）' : '离线模拟（不扣 CU）'}</dd>
+              <dt>机器</dt><dd>{resolveInstanceSubmission(runtimeChoice, instances).machineLabel}</dd>
               <dt>数量</dt><dd>{batchCount}</dd>
               {runtime === 'colab' && <><dt>最长运行</dt><dd>{maxRuntime} 分钟</dd></>}
             </dl>
-            {error && <p className="status error" role="alert">{error}。可到「任务」页确认是否已提交，或直接再点一次确认。</p>}
+            {error && <p className="status error" role="alert">{error}</p>}
             <div className="actions">
               <button className="button secondary" type="button" onClick={() => setConfirm(null)}>取消</button>
               <button className="button" disabled={loading === 'submit'} type="button" onClick={() => void submitJob()}>
@@ -994,6 +1014,7 @@ export default function App() {
               <dt>运行方式</dt><dd>{detail.provider === 'mock' ? '离线模拟' : detail.provider === 'colab' ? 'Colab GPU' : shown(detail.provider)}</dd>
               <dt>创建时间</dt><dd>{formatInstanceTime(detail.created_at)}</dd>
             </dl>
+            <p className="muted small">{taskStatusNote(detail)}</p>
             {Array.isArray(detail.attempts) && <details className="foldable" open>
               <summary>执行记录</summary>
               <div className="foldContent">
@@ -1004,10 +1025,15 @@ export default function App() {
               </div>
             </details>}
             {(detail.timings || detail.timing_details || detail.logs || detail.events) ? <JobHistoryDetails job={detail} /> : null}
+            {stageSecondsTotal(jobDetailTimings(detail)) ? <p className="muted small">各阶段相加约 {stageSecondsTotal(jobDetailTimings(detail))}。阶段按秒独立计时，可能重叠，不是工作流发布又额外等了这么久。</p> : null}
             {detail.resolved_params ? (
               <details className="foldable">
                 <summary>本次使用的参数</summary>
-                <div className="foldContent"><pre className={styles.diagnostics}>{JSON.stringify(detail.resolved_params, null, 2)}</pre></div>
+                <div className="foldContent">
+                  <dl className={styles.kv}>
+                    {paramRows(detail.resolved_params).map((row) => <Fragment key={row.key}><dt>{row.label}</dt><dd>{row.value}</dd></Fragment>)}
+                  </dl>
+                </div>
               </details>
             ) : null}
           </section>

@@ -207,10 +207,6 @@ class AtelierConnector:
         url = self._url(path)
         try:
             response = self.client.request(method, url, follow_redirects=False, **kwargs)
-        except TypeError:
-            # Older httpx clients do not accept per-request follow_redirects;
-            # the constructor check still prevents configured redirect following.
-            response = self.client.request(method, url, **kwargs)
         except httpx.TimeoutException:
             # export_asset needs to distinguish a timeout after POST from a
             # normal transport failure so it can reconcile by listing assets.

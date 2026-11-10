@@ -40,7 +40,7 @@ def test_cuda_admission_official_spec_without_creating_runtime(monkeypatch):
     )
 
     class ReadOnlyProvider:
-        def __init__(self, *_):
+        def __init__(self, *_, **__):
             pass
 
         def list_specs(self):

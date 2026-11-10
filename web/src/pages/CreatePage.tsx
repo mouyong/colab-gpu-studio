@@ -13,6 +13,7 @@ import type { RuntimeSelectionValue } from '../components/RuntimeSelection';
 import type { GpuAccount, GpuInstance } from '../components/AccountDirectory';
 import { Card, InfoTip, Segmented } from '../components/ui';
 import { RUNTIME_HELP } from '../lib/labels';
+import { workflowTitle, workflowUsage } from '../lib/workflow-copy';
 import { parameterList, parameterKey, shown } from '../lib/ui-helpers';
 import styles from '../gpu.module.css';
 
@@ -194,10 +195,10 @@ export function CreatePanel({
             <span className={styles.wfThumb}><Layers size={20} strokeWidth={1.4} aria-hidden /></span>
             <span className={styles.wfBody}>
               <span className={styles.wfName}>
-                <strong>{activeWorkflow.workflow_key}</strong>
+                <strong>{workflowTitle(activeWorkflow)}</strong>
                 <span className="pill">v{activeWorkflow.workflow_version}</span>
               </span>
-              <small className="muted">{subtitle}</small>
+              <small className="muted">{activeWorkflow.workflow_key}{subtitle ? ` · ${subtitle}` : ''}</small>
             </span>
           </button>
         ) : <p className="muted small">还没有可用的工作流，请先到「设置 › 工作流与模型」发布一个。</p>}
@@ -380,8 +381,9 @@ export function CreatePanel({
                   <div key={fam.key} className={styles.pickItem} data-on={here}>
                     <button type="button" className={styles.pickMain} onClick={() => { chooseFamily(fam); setPickerOpen(false); }}>
                       <span>
-                        <strong>{fam.key}</strong>
-                        <small className="muted">{modelName(fam.modelId)}</small>
+                        <strong>{workflowTitle(list[0] || { workflow_key: fam.key })}</strong>
+                        <small className="muted">{workflowUsage(list[0] || { workflow_key: fam.key }) || modelName(fam.modelId)}</small>
+                        <small className="muted">{fam.key}</small>
                       </span>
                       {here && <Check size={18} strokeWidth={1.8} aria-hidden />}
                     </button>

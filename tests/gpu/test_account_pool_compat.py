@@ -106,6 +106,9 @@ class SmokeRepo:
             if owner_id is None or row.get("owner_id") == owner_id
         ]
 
+    def get(self, kind, row_id, owner_id=None):
+        return next((row for row in self.list(kind, owner_id) if row.get("id") == row_id), None)
+
     def create_job(self, owner_id, body, key):
         from app.gpu.manifest import digest
 

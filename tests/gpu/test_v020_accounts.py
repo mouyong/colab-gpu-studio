@@ -88,10 +88,8 @@ def test_provider_and_executor_factories_route_account_id(monkeypatch):
     captured = {}
 
     class FakeProvider:
-        @classmethod
-        def from_environment(cls, **kwargs):
-            captured["provider"] = kwargs
-            return cls()
+        def __init__(self, store, owner_id, *, account_id):
+            captured["provider"] = {"store": store, "owner_id": owner_id, "account_id": account_id}
 
     class FakeExecutor:
         @classmethod

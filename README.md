@@ -1,6 +1,6 @@
 **简体中文** | [English](README.en.md)
 
-> 当前版本 0.2.10：修复网页已配置 OAuth 后，新增账号仍无法开始授权的问题。包含 Colab CLI 算力号接入、独立 Drive 绑定与 CU 对账更新。详见 [0.2.10 更新说明](docs/RELEASE_NOTES_0.2.10.md)；离线/Mock 验收记录见 [离线实施记录](docs/OFFLINE_IMPLEMENTATION.md)。
+> 当前版本 0.3.0：清理防御性代码，修复 #24。详见下方 [0.3.0 发布说明](#030-发布说明)；离线/Mock 验收记录见 [离线实施记录](docs/OFFLINE_IMPLEMENTATION.md)。
 
 # Colab GPU Studio
 
@@ -10,8 +10,8 @@
 
 ## 下载与在线演示
 
-- **最新版本**：[0.2.10 Release](https://github.com/TizenryA/colab-gpu-studio/releases/tag/v0.2.10)（源码 + 更新说明）。
-- **预编译多平台独立包**：[0.2.10 Release 附件](https://github.com/TizenryA/colab-gpu-studio/releases/tag/v0.2.10) 提供 Windows x86_64 / Linux x86_64 / macOS x64 / macOS arm64 / Android Termux 五个包；桌面包内置 Python 和依赖，Termux 包首次启动需联网安装原生依赖；SHA-256 见附件里的 `SHA256SUMS.txt`。
+- **最新版本**：[0.3.0 Release](https://github.com/TizenryA/colab-gpu-studio/releases/tag/v0.3.0)（源码 + 更新说明）。
+- **预编译多平台独立包**：[0.3.0 Release 附件](https://github.com/TizenryA/colab-gpu-studio/releases/tag/v0.3.0) 提供 Windows x86_64 / Linux x86_64 / macOS x64 / macOS arm64 / Android Termux 五个包；桌面包内置 Python 和依赖，Termux 包首次启动需联网安装原生依赖；SHA-256 见附件里的 `SHA256SUMS.txt`。
 - **只读界面演示**：[打开 Cloudflare Workers 演示站](https://gpu-colab-studio-demo.tizenry.tech)。公开演示密码：`demo-readonly`。
 - 演示站使用 **0.1.31-dev.8 原版前端**，展示独立的 Mock 数据快照，不连接生产站、Google 或真实 GPU，不消耗 CU。生成、上传、修改、删除和授权均不可用；完整功能请下载后自行部署。
 - [演示说明与更多截图](docs/DEMO.md)。以下截图来自线上演示站的实际浏览器，不是设计稿。
@@ -26,6 +26,41 @@
 ![桌面创作页](docs/demo/screenshots/desktop-create.png)
 
 </details>
+
+## 0.3.0 发布说明
+
+这一版没有加新功能，主要做两件事：清理代码，修复 #24。
+
+**清理防御性代码**（约删 1270 行、加 490 行）
+
+- 调度器、实例、账号、Drive、工作台只对接真实数据层，删掉为测试替身准备的探测、回退调用和兼容分支。
+- 删掉只吞错误、不做补救的 try/except，以及重复校验、不会发生的分支和没人用的配置项。
+- 登录认证、用户隔离、路径检查、密钥处理，以及调用 Colab、Drive、子进程时的错误处理都保留。
+
+**修复 #24**（参考并合入了 @CyrusAuyeung 在 #25 中的实现，谢谢）
+
+- 运行时用 nvidia-smi 上报实际 GPU，任务、实例和租约记录真实型号，界面分开显示“实际 GPU”和“申请规格”。
+- 只有一个已授权 Colab 账号时，自动分配会先绑定这个账号；缓存准备和 Drive 同步用对的计算号和 Drive 号。
+- 分配失败区分“没有空闲 GPU（NO_RUNTIMES）”和其他错误，不再把 Google 原始报错显示出来。
+- 已释放或正在清理的租约不会被再次分配；清理重试成功后清掉临时提示，保留原始失败原因。
+- Windows 协调端改用跨平台文件锁，时间戳统一带时区。
+
+**测试情况**
+
+- 后端 509 项、前端 43 项测试通过，类型检查、生产构建和契约检查通过。
+- 在真实 Colab L4 上跑了一次 CUDA 冒烟：识别到 NVIDIA L4，任务结束后运行时正常释放。
+- 还没验证：Windows 文件锁没有在 Windows 真机上试过。
+
+升级前请备份数据库和 `.env`，不需要数据迁移。完整说明见 [0.3.0 更新说明](docs/RELEASE_NOTES_0.3.0.md)。
+
+**下载**
+
+- [Colab-GPU-Studio-v0.3.0-windows-x86_64.zip](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.0/Colab-GPU-Studio-v0.3.0-windows-x86_64.zip)
+- [Colab-GPU-Studio-v0.3.0-linux-x86_64.tar.gz](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.0/Colab-GPU-Studio-v0.3.0-linux-x86_64.tar.gz)
+- [Colab-GPU-Studio-v0.3.0-macos-x86_64.tar.gz](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.0/Colab-GPU-Studio-v0.3.0-macos-x86_64.tar.gz)
+- [Colab-GPU-Studio-v0.3.0-macos-arm64.tar.gz](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.0/Colab-GPU-Studio-v0.3.0-macos-arm64.tar.gz)
+- [Colab-GPU-Studio-v0.3.0-android-termux.zip](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.0/Colab-GPU-Studio-v0.3.0-android-termux.zip)
+- [SHA256SUMS.txt](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.0/SHA256SUMS.txt)
 
 ## 为什么做这个？
 

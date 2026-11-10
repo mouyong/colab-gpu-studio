@@ -41,7 +41,6 @@ class GpuConfig:
     cleanup_retry_base_seconds: float = 2.0
     cleanup_retry_max_seconds: float = 300.0
     claim_ttl_seconds: float = 120.0
-    spec_allowlist: tuple[str, ...] = ()
     # Trusted executor plugins are administrator-only and fail closed unless
     # explicitly enabled with an exact module:entrypoint@version allowlist.
     trusted_executor_enabled: bool = False
@@ -74,9 +73,6 @@ class GpuConfig:
         if max_runtime <= 0 or retries < 0:
             raise ValueError("GPU runtime must be positive and retries non-negative")
         rate_text = os.getenv("GPU_UNIT_RATE", "").strip()
-        allowlist = tuple(
-            item.strip() for item in os.getenv("GPU_SPEC_ALLOWLIST", "").split(",") if item.strip()
-        )
         trusted_allowlist = tuple(
             item.strip()
             for item in os.getenv("GPU_TRUSTED_EXECUTOR_ALLOWLIST", "").split(",")
@@ -95,7 +91,6 @@ class GpuConfig:
             cleanup_retry_base_seconds=max(0.0, cls._number("GPU_CLEANUP_RETRY_BASE_SECONDS", 2)),
             cleanup_retry_max_seconds=max(0.0, cls._number("GPU_CLEANUP_RETRY_MAX_SECONDS", 300)),
             claim_ttl_seconds=max(1.0, cls._number("GPU_CLAIM_TTL_SECONDS", 120)),
-            spec_allowlist=allowlist,
             trusted_executor_enabled=cls._bool("GPU_TRUSTED_EXECUTOR_ENABLED", False),
             trusted_executor_type=os.getenv("GPU_TRUSTED_EXECUTOR_TYPE", "trusted").strip(),
             trusted_executor_module=os.getenv("GPU_TRUSTED_EXECUTOR_MODULE", "").strip(),
@@ -348,21 +343,9 @@ def default_provider_factory(
     if name == "colab" and (os.getenv("STUDIO_OFFLINE_TEST") == "1" or not config.real_enabled):
         return DisabledProvider("real GPU provider is disabled or unconfigured")
     if name == "colab":
-        try:
-            from .colab import GoogleColabProvider
-        except (ImportError, ModuleNotFoundError):
-            return DisabledProvider("real Colab provider is unavailable")
-        if hasattr(GoogleColabProvider, "from_environment"):
-            return GoogleColabProvider.from_environment(
-                store=store,
-                owner_id=owner_id or job.get("owner_id"),
-                account_id=job.get("account_id"),
-            )
-        return GoogleColabProvider(
-            store,
-            owner_id or job.get("owner_id"),
-            account_id=job.get("account_id"),
-        )
+        from .colab import GoogleColabProvider
+
+        return GoogleColabProvider(store, owner_id or job.get("owner_id"), account_id=job.get("account_id"))
     return DisabledProvider(f"unknown GPU provider: {name}")
 
 
@@ -390,10 +373,8 @@ def _is_builtin_mcp_job(job: dict) -> bool:
 
 
 def _mcp_executor(job: dict, *, store=None, owner_id: str | None = None):
-    try:
-        from .mcp import MCPGPUExecutor
-    except (ImportError, ModuleNotFoundError):
-        return DisabledExecutor()
+    from .mcp import MCPGPUExecutor
+
     return MCPGPUExecutor.from_environment(
         store=store,
         owner_id=owner_id or job.get("owner_id"),

@@ -18,6 +18,17 @@ class ColabError(GoogleError):
     pass
 
 
+class ColabAllocationError(ColabError):
+    def __init__(self, code, reason):
+        self.reason = reason
+        # Only the numeric code is shown; Google's own text may carry private data.
+        if reason == "NO_RUNTIMES":
+            message = "Colab 暂时无法分配运行时（NO_RUNTIMES）；请稍后重试"
+        else:
+            message = f"Colab 分配 Operation 失败（code {code}）"
+        super().__init__(message)
+
+
 _CLI_PUBLIC_CLIENT_ID = "764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com"
 _TUNNEL_BASE_URL = "https://colab.research.google.com"
 _XSSI_PREFIX = ")]}'\n"
@@ -57,12 +68,6 @@ class GoogleColabProvider:
         self._owns_client = client is None
         self.google = google or GoogleService(store, owner_id, account_id=account_id, client=self.client)
         self.base_url = base_url.rstrip("/")
-
-    @classmethod
-    def from_environment(cls, store=None, owner_id=None, **kwargs):
-        if store is None or not owner_id:
-            raise ColabError("Colab 需要已认证用户及持久化 Repository")
-        return cls(store, owner_id, **kwargs)
 
     def _request(self, method, path, *, params=None, json=None):
         token = self.google.access_token("colab")
@@ -280,11 +285,25 @@ class GoogleColabProvider:
         return dict(key)
 
     @staticmethod
+    def _operation_failure(operation):
+        """Summarise a failed allocation Operation by its code and ErrorInfo reason only.
+
+        Google's message and metadata may contain credentials or notebook data.
+        """
+        error = operation.get("error")
+        if not error:
+            return {}
+        reason = next((d.get("reason") for d in error.get("details") or []
+                       if d.get("@type") == "type.googleapis.com/google.rpc.ErrorInfo"), None)
+        return {"allocation_failed": True,
+                "allocation_error_code": error.get("code", "unknown"),
+                "allocation_failure_reason": reason}
+
+    @staticmethod
     def _raise_operation_error(operation):
-        if operation.get("error"):
-            code = (operation["error"] or {}).get("code", "unknown")
-            # Google's detail may contain credentials or notebook data: expose only safe code.
-            raise ColabError(f"Colab 分配 Operation 失败（code {code}），请检查资格、配额与库存")
+        failure = GoogleColabProvider._operation_failure(operation)
+        if failure:
+            raise ColabAllocationError(failure["allocation_error_code"], failure["allocation_failure_reason"])
 
     def _create_tunnel(self, lease: dict, key: dict, request_uuid: uuid.UUID, request_id: str, runtime_id: str) -> dict:
         nbh = _uuid_to_web_safe_base64(request_uuid)
@@ -437,10 +456,10 @@ class GoogleColabProvider:
                 "version": "colab-cli-tunnel",
             }
         operation = self._operation(handle, lease)
-        if operation is not None:
-            if operation.get("done") is not True:
-                return {"ready": False, "deleted": False, "operation_pending": True}
-            self._raise_operation_error(operation)
+        if operation is not None and operation.get("done") is not True:
+            return {"ready": False, "deleted": False, "operation_pending": True}
+        # A failed Operation still needs the runtime GET: a runtime that exists must be cleaned up.
+        failure = self._operation_failure(operation) if operation is not None else {}
         response = self._request("GET", "/v1beta/" + handle["runtime_name"])
         if response.status_code == 404:
             # No Operation + a previously attempted create whose response was lost is ambiguous.
@@ -449,7 +468,9 @@ class GoogleColabProvider:
                 and int(lease.get("create_attempts", 0)) > 0
                 and not lease.get("operation_done")
             )
-            return {"ready": False, "deleted": not unknown, "allocation_unknown": unknown}
+            return {"ready": False, "deleted": not unknown, "allocation_unknown": unknown, **failure}
+        if failure:
+            return {"ready": False, "deleted": False, **failure}
         runtime = self._json(response)
         return {
             "ready": bool(runtime.get("connectionInfo")),

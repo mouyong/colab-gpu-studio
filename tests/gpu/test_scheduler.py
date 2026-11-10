@@ -7,58 +7,9 @@ from app.gpu.repository import Repository
 from app.gpu.scheduler import Scheduler
 
 
-class MemoryStore:
-    def __init__(self):
-        self.rows = {k: [] for k in ("jobs", "leases", "events", "usage", "assets")}
-
-    class _Lock:
-        def __enter__(self):
-            return True
-
-        def __exit__(self, *args):
-            return False
-
-    def dispatch_lock(self):
-        return self._Lock()
-
-    def create(self, kind, owner_id, data, project_id=None, record_id=None):
-        row = {
-            "id": record_id or f"{kind}-{len(self.rows[kind]) + 1}",
-            "owner_id": owner_id,
-            "project_id": project_id,
-            **data,
-        }
-        self.rows[kind].append(row)
-        return dict(row)
-
-    def get(self, kind, id, owner_id=None):
-        for row in self.rows[kind]:
-            if row["id"] == id and (owner_id is None or row["owner_id"] == owner_id):
-                return dict(row)
-        return None
-
-    def list(self, kind, owner_id=None, project_id=None):
-        return [
-            dict(x)
-            for x in self.rows[kind]
-            if (owner_id is None or x["owner_id"] == owner_id)
-            and (project_id is None or x.get("project_id") == project_id)
-        ]
-
-    def update(self, kind, id, patch, owner_id=None):
-        row = self.get(kind, id, owner_id)
-        if row is None:
-            raise KeyError(id)
-        for stored in self.rows[kind]:
-            if stored["id"] == id:
-                stored.update(patch)
-                return dict(stored)
-        raise KeyError(id)
-
-    def event(self, job_id, owner_id, state, message, progress=None):
-        return self.create(
-            "events", owner_id, {"job_id": job_id, "state": state, "message": message, "progress": progress}
-        )
+def MemoryStore():
+    """In-memory SQLite Repository: the scheduler always runs against the real store."""
+    return Repository(Store("sqlite:///:memory:"))
 
 
 @dataclass
@@ -151,7 +102,7 @@ def test_cleanup_pending_blocks_next_job_until_watchdog():
     assert provider.delete_calls == 1
     assert store.get("jobs", first["id"])["state"] == "cleanup_pending"
     assert store.get("jobs", second["id"])["state"] != "completed"
-    clock.now = store.get("leases", "leases-1")["cleanup_next_epoch"]
+    clock.now = store.list("leases", "u1")[0]["cleanup_next_epoch"]
     scheduler.watchdog()
     assert provider.delete_calls == 2
     assert drive(scheduler, second["id"])["state"] == "completed"
@@ -209,7 +160,7 @@ def test_unknown_real_provider_fails_closed(monkeypatch):
     store = MemoryStore()
     job = make_job(store, job_id="real-disabled", provider="colab")
     result = drive(Scheduler(store, config=GpuConfig.from_env()), job["id"])
-    assert result["state"] == "failed" and result["error_code"] == "gpu_provider_unavailable"
+    assert result["state"] == "failed" and not store.list("leases", "u1")
 
 
 class SQLiteOutputStorage:

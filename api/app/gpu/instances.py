@@ -13,12 +13,14 @@ import copy
 import math
 import time
 import uuid
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Mapping
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
+
+from app.db import utc_isoformat
 
 from .manifest import digest
 
@@ -60,64 +62,29 @@ class InstanceService:
 
     def __init__(self, repo, clock=time.time, config=None):
         self.repo = repo
-        self.store = getattr(repo, "store", repo)
+        self.store = repo.store
         self.clock = clock
         self.config = config
 
     # ---- repository/model plumbing -------------------------------------------------
     def _model(self, kind):
-        getter = getattr(self.repo, "_model", None)
-        if getter:
-            try:
-                return getter(kind)
-            except (KeyError, ValueError):
-                pass
-        models = getattr(self.repo, "MODELS", None)
-        if models and kind in models:
-            return models[kind]
-        try:
-            from app.db import MODELS
-
-            return MODELS.get("gpu_" + kind) or MODELS[kind]
-        except (ImportError, KeyError):
-            raise ValueError(f"repository has no {kind} model") from None
+        return self.repo._model(kind)
 
     @contextmanager
     def _tx(self):
-        lock = getattr(self.store, "db_lock", None)
-        with (lock() if lock else nullcontext()):
-            with self.store.Session.begin() as session:
-                yield session
+        with self.store.db_lock(), self.store.Session.begin() as session:
+            yield session
 
     @contextmanager
     def _admission(self):
-        lock = getattr(self.store, "admission_lock", None)
-        if lock:
-            with lock(timeout=float(self._cfg("admission_timeout_seconds", 1.0))) as acquired:
-                if not acquired:
-                    raise InstanceConflict("资源分配正在进行，请稍后重试")
-                yield
-            return
-        lock = getattr(self.store, "dispatch_lock", None)
-        if lock:
-            with lock() as acquired:
-                if not acquired:
-                    raise InstanceConflict("资源分配正在进行，请稍后重试")
-                yield
-            return
-        yield
+        with self.store.admission_lock(timeout=float(self._cfg("admission_timeout_seconds", 1.0))) as acquired:
+            if not acquired:
+                raise InstanceConflict("资源分配正在进行，请稍后重试")
+            yield
 
     @staticmethod
     def _data(row) -> dict:
         return copy.deepcopy(getattr(row, "data", None) or {})
-
-    @staticmethod
-    def _now_iso(value):
-        if value is None:
-            return None
-        if isinstance(value, datetime):
-            return value.isoformat()
-        return value
 
     def _dict(self, row) -> dict:
         data = self._data(row)
@@ -126,8 +93,8 @@ class InstanceService:
         result.update(
             state=row.state,
             version=row.version,
-            created_at=self._now_iso(getattr(row, "created_at", None)),
-            updated_at=self._now_iso(getattr(row, "updated_at", None)),
+            created_at=utc_isoformat(row.created_at),
+            updated_at=utc_isoformat(row.updated_at),
         )
         return result
 
@@ -314,36 +281,22 @@ class InstanceService:
         """Return billed usage plus every still-live instance reservation."""
         now = float(self.clock())
         daily = monthly = 0.0
-        try:
-            segments = self._rows(session, "instance_usage_segments", owner_id)
-        except ValueError:
-            segments = []
-        for row in segments:
+        for row in self._rows(session, "instance_usage_segments", owner_id):
             data = self._data(row)
             if account_id is not None and data.get("account_id") not in {None, account_id}:
                 continue
             value = data.get("actual_units") if data.get("actual_units") is not None else data.get("estimated_units")
             if value is None:
                 continue
-            try:
-                value = float(value)
-            except (TypeError, ValueError):
-                raise BudgetError("GPU usage ledger contains an invalid value") from None
+            value = float(value)
             stamp = data.get("created_epoch", data.get("epoch", data.get("started_at")))
-            try:
-                stamp = float(stamp) if stamp is not None else None
-            except (TypeError, ValueError):
-                stamp = None
+            stamp = float(stamp) if stamp is not None else None
             if stamp is None or stamp >= now - 31 * 86400:
                 monthly += value
             if stamp is None or stamp >= now - 86400:
                 daily += value
 
-        try:
-            instances = self._rows(session, "instances", owner_id)
-        except ValueError:
-            instances = []
-        for row in instances:
+        for row in self._rows(session, "instances", owner_id):
             data = self._data(row)
             if account_id is not None and data.get("account_id") != account_id:
                 continue
@@ -351,17 +304,7 @@ class InstanceService:
             # confirmed.  Unknown/cleanup states are also fail-closed here.
             if row.state == "deleted":
                 continue
-            reservations = []
-            for name in ("budget_reserved", "retention_reserved"):
-                value = data.get(name)
-                if value is not None:
-                    try:
-                        reservations.append(float(value))
-                    except (TypeError, ValueError):
-                        raise BudgetError("active GPU reservation is invalid") from None
-            if any(not math.isfinite(value) or value < 0 for value in reservations):
-                raise BudgetError("active GPU reservation is invalid")
-            reserved = sum(reservations)
+            reserved = float(data.get("budget_reserved") or 0) + float(data.get("retention_reserved") or 0)
             daily += reserved
             monthly += reserved
         return daily, monthly
@@ -372,13 +315,6 @@ class InstanceService:
         global_monthly = self._cfg("monthly_units")
         if global_daily is None:
             raise BudgetError("GPU global budget is not configured")
-        try:
-            global_daily = float(global_daily)
-            global_monthly = None if global_monthly is None else float(global_monthly)
-        except (TypeError, ValueError) as exc:
-            raise BudgetError("GPU global budget is invalid") from exc
-        if not math.isfinite(global_daily) or global_daily < 0 or (global_monthly is not None and (not math.isfinite(global_monthly) or global_monthly < 0)):
-            raise BudgetError("GPU global budget is invalid")
 
         account_id = self._account_id(account)
         account_daily_used, account_monthly_used = self._budget_totals(session, account.owner_id, account_id)
@@ -399,12 +335,8 @@ class InstanceService:
         if provider == "mock":
             return 0.0
         rate = self._cfg("unit_rate")
-        try:
-            rate = float(rate)
-        except (TypeError, ValueError) as exc:
-            raise BudgetError("real GPU retention requires an explicit unit_rate") from exc
-        if not math.isfinite(rate) or rate <= 0:
-            raise BudgetError("real GPU retention requires a finite positive unit_rate")
+        if not rate or rate <= 0:
+            raise BudgetError("real GPU retention requires a positive unit_rate")
         return float(minutes) * rate
 
     def _cursor_id(self, owner_id, project_id):
@@ -903,10 +835,7 @@ class InstanceService:
 
     def events(self, owner, id):
         with self._tx() as session:
-            try:
-                rows = self._rows(session, "events", owner)
-            except ValueError:
-                return []
+            rows = self._rows(session, "events", owner)
             return [self._redact(self._dict(row)) for row in rows if self._data(row).get("instance_id") == id]
 
     def usage(self, owner, id=None):

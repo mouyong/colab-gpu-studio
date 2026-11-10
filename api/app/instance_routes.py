@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Request
@@ -10,8 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .common import APIError, current_user, ok
 from .gpu.instances import AllocationError, BudgetError, InstanceConflict, InstanceServiceError
-from .gpu.repository import Repository
-from .gpu.workbench import WorkbenchError, WorkbenchService
+from .gpu.workbench import WorkbenchError
 from .presenters import public_job
 
 router = APIRouter(prefix="/api/gpu")
@@ -84,31 +82,11 @@ def _safe_public(value: Any):
 
 
 def _service(request: Request):
-    service = getattr(request.app.state, "instance_service", None)
-    if service is None:
-        factory = getattr(request.app.state, "instance_service_factory", None)
-        if callable(factory):
-            service = factory(request)
-    if service is None:
-        raise APIError("INSTANCE_SERVICE_UNAVAILABLE", "实例服务尚未接入", 503, True)
-    return service
+    return request.app.state.instance_service
 
 
-def _repo(request: Request, service):
-    repo = getattr(request.app.state, "repo", None) or getattr(service, "repo", None)
-    if repo is not None:
-        return repo
-    store = getattr(request.app.state, "store", None)
-    if store is None:
-        raise APIError("INSTANCE_SERVICE_UNAVAILABLE", "实例存储尚未接入", 503, True)
-    return Repository(store)
-
-
-def _list(repo, kind, owner):
-    try:
-        return list(repo.list(kind, owner))
-    except (AttributeError, KeyError, ValueError):
-        return []
+def _repo(request: Request):
+    return request.app.state.repo
 
 
 def _domain_error(exc):
@@ -125,77 +103,31 @@ def _domain_error(exc):
     return None
 
 
-def _get(repo, kind, record_id, owner):
+def _instance(service, instance_id: str, owner: str):
     try:
-        return repo.get(kind, record_id, owner)
-    except (AttributeError, KeyError, ValueError):
-        for row in _list(repo, kind, owner):
-            if row.get("id") == record_id:
-                return row
-        return None
-
-
-def _instance(request: Request, service, instance_id: str, owner: str):
-    repo = _repo(request, service)
-    getter = getattr(service, "get", None)
-    row = None
-    if callable(getter):
-        try:
-            row = getter(owner, instance_id)
-        except TypeError:
-            row = getter(instance_id, owner)
-        except (InstanceServiceError, KeyError) as exc:
-            mapped = _domain_error(exc)
-            if mapped and mapped.code != "NOT_FOUND":
-                raise mapped from exc
-    if row is None:
-        row = _get(repo, "instances", instance_id, owner)
-    if row is None:
-        # A service may have a non-Repository read model.  It is still required
-        # to return owner-bound records; never accept a client-supplied owner.
-        getter = getattr(service, "get", None)
-        if callable(getter):
-            try:
-                row = getter(owner, instance_id)
-            except TypeError:
-                row = getter(instance_id, owner)
-    if not isinstance(row, dict):
-        raise APIError("NOT_FOUND", "实例不存在或不属于当前用户", 404)
-    if row.get("owner_id") not in (None, owner):
+        row = service.get(owner, instance_id)
+    except (InstanceServiceError, KeyError) as exc:
+        raise _domain_error(exc) from exc
+    if not row:
         raise APIError("NOT_FOUND", "实例不存在或不属于当前用户", 404)
     return row
 
 
 def _public(service, row):
-    public = getattr(service, "public", None)
-    value = public(row) if callable(public) else row
-    return _safe_public(copy.deepcopy(value))
+    return _safe_public(service.public(row))
 
 
 def _related(request: Request, instance_id: str, owner: str):
-    service = _service(request)
-    repo = _repo(request, service)
-    jobs = [row for row in _list(repo, "jobs", owner) if row.get("instance_id") == instance_id]
-    event_reader = getattr(service, "events", None)
-    if callable(event_reader):
-        try:
-            events = list(event_reader(owner, instance_id))
-        except (InstanceServiceError, KeyError) as exc:
-            raise _domain_error(exc) from exc
-    else:
-        events = [
-            row
-            for kind in ("instance_events", "events")
-            for row in _list(repo, kind, owner)
-            if row.get("instance_id") == instance_id
-        ]
+    jobs = [row for row in _repo(request).list("jobs", owner) if row.get("instance_id") == instance_id]
+    try:
+        events = _service(request).events(owner, instance_id)
+    except (InstanceServiceError, KeyError) as exc:
+        raise _domain_error(exc) from exc
     return jobs, events
 
 
-def _public_job_item(job: Any):
-    if isinstance(job, dict):
-        return _safe_public(public_job(job))
-    return _safe_public(job)
+def _public_job_item(job: dict):
+    return _safe_public(public_job(job))
 
 
 @router.get("/instances")
@@ -206,19 +138,7 @@ def instances(
     user=Depends(current_user),
 ):
     service = _service(request)
-    repo = _repo(request, service)
-    listed = getattr(service, "list", None)
-    if callable(listed):
-        try:
-            rows = list(listed(user["id"], state=state))
-        except TypeError:
-            rows = list(listed(user["id"], state))
-        except (InstanceServiceError, KeyError) as exc:
-            raise _domain_error(exc) from exc
-    else:
-        rows = _list(repo, "instances", user["id"])
-    if state:
-        rows = [row for row in rows if row.get("state") == state]
+    rows = service.list(user["id"], state=state)
     result = []
     for row in rows:
         item = _public(service, row)
@@ -233,7 +153,7 @@ def instances(
 @router.get("/instances/{instance_id}")
 def instance_detail(instance_id: str, request: Request, user=Depends(current_user)):
     service = _service(request)
-    row = _instance(request, service, instance_id, user["id"])
+    row = _instance(service, instance_id, user["id"])
     jobs, events = _related(request, instance_id, user["id"])
     item = _public(service, row)
     item["jobs"] = [_public_job_item(job) for job in jobs]
@@ -244,7 +164,7 @@ def instance_detail(instance_id: str, request: Request, user=Depends(current_use
 @router.get("/instances/{instance_id}/jobs")
 def instance_jobs(instance_id: str, request: Request, user=Depends(current_user)):
     service = _service(request)
-    _instance(request, service, instance_id, user["id"])
+    _instance(service, instance_id, user["id"])
     jobs, _ = _related(request, instance_id, user["id"])
     return ok([_public_job_item(job) for job in jobs], request)
 
@@ -252,7 +172,7 @@ def instance_jobs(instance_id: str, request: Request, user=Depends(current_user)
 @router.get("/instances/{instance_id}/events")
 def instance_events(instance_id: str, request: Request, user=Depends(current_user)):
     service = _service(request)
-    _instance(request, service, instance_id, user["id"])
+    _instance(service, instance_id, user["id"])
     _, events = _related(request, instance_id, user["id"])
     return ok([_safe_public(event) for event in events], request)
 
@@ -260,31 +180,27 @@ def instance_events(instance_id: str, request: Request, user=Depends(current_use
 @router.patch("/instances/{instance_id}/retention", status_code=202)
 def retention(instance_id: str, body: RetentionInput, request: Request, user=Depends(current_user)):
     service = _service(request)
-    row = _instance(request, service, instance_id, user["id"])
+    row = _instance(service, instance_id, user["id"])
     if row.get("state") in {"deleted", "unknown", "cleanup_pending", "quarantined"}:
         raise APIError("INSTANCE_READ_ONLY", "实例已失效，不能修改保留策略", 409)
     mode = body.mode or body.retention_mode
     key = body.key or request.headers.get("Idempotency-Key")
     if not key:
         raise APIError("IDEMPOTENCY_REQUIRED", "保留策略更新必须提供固定幂等键")
-    if mode not in {"retain", "release", "save", "none", "cancel", "smart"}:
-        raise APIError("RETENTION_MODE_INVALID", "保留模式只能是 retain 或 release", 422)
-    mode = "release" if mode in {"cancel", "none"} else mode
+
     try:
         value = service.retention(
             user["id"], instance_id, mode, body.idle_minutes, key, expected_version=body.expected_version
         )
-    except TypeError:
-        value = service.retention(user["id"], instance_id, mode, body.idle_minutes, key, body.expected_version)
     except (InstanceServiceError, KeyError) as exc:
         raise _domain_error(exc) from exc
-    return ok(_public(service, value) if isinstance(value, dict) else value, request, 202)
+    return ok(_public(service, value), request, 202)
 
 
 @router.post("/instances/{instance_id}/stop", status_code=202)
 def stop_instance(instance_id: str, body: StopInput, request: Request, user=Depends(current_user)):
     service = _service(request)
-    row = _instance(request, service, instance_id, user["id"])
+    row = _instance(service, instance_id, user["id"])
     if body.confirmed is not True:
         raise APIError("CONFIRMATION_REQUIRED", "停止实例必须明确 confirmed=true", 422)
     key = body.key or request.headers.get("Idempotency-Key")
@@ -294,43 +210,32 @@ def stop_instance(instance_id: str, body: StopInput, request: Request, user=Depe
         return ok({"id": instance_id, "state": "deleted", "operation": "already_deleted"}, request, 202)
     try:
         value = service.stop(user["id"], instance_id, key)
-    except TypeError:
-        value = service.stop(user["id"], instance_id, key, confirmed=True)
     except (InstanceServiceError, KeyError) as exc:
         raise _domain_error(exc) from exc
-    # A request to stop is not evidence of remote deletion.
-    if isinstance(value, dict) and value.get("state") == "deleted" and row.get("state") != "deleted":
-        value = {**value, "state": "releasing", "remote_delete_confirmed": False}
-    return ok(_public(service, value) if isinstance(value, dict) else value, request, 202)
+    return ok(_public(service, value), request, 202)
 
 
-def _workbench(request: Request, service):
-    wb = getattr(request.app.state, "workbench_service", None)
-    if wb is not None:
-        return wb
-    repo = _repo(request, service)
-    wb = WorkbenchService(repo=repo)
-    request.app.state.workbench_service = wb
-    return wb
+def _workbench(request: Request):
+    return request.app.state.workbench_service
 
 
 @router.get("/instances/{instance_id}/workbench")
 def workbench_info(instance_id: str, request: Request, user=Depends(current_user)):
     service = _service(request)
-    row = _instance(request, service, instance_id, user["id"])
-    return ok(_workbench(request, service).describe(user["id"], row), request)
+    row = _instance(service, instance_id, user["id"])
+    return ok(_workbench(request).describe(user["id"], row), request)
 
 
 @router.post("/instances/{instance_id}/workbench/actions")
 def workbench_action(instance_id: str, body: WorkbenchActionInput, request: Request, user=Depends(current_user)):
     service = _service(request)
-    row = _instance(request, service, instance_id, user["id"])
+    row = _instance(service, instance_id, user["id"])
     payload = body.model_dump(exclude={"action", "key"})
     key = request.headers.get("Idempotency-Key") or body.key
     if body.key and request.headers.get("Idempotency-Key") and body.key != request.headers["Idempotency-Key"]:
         raise APIError("IDEMPOTENCY_CONFLICT", "请求头与正文幂等键不一致", 409)
     try:
-        result = _workbench(request, service).execute(user["id"], row, body.action, payload, key)
+        result = _workbench(request).execute(user["id"], row, body.action, payload, key)
     except WorkbenchError as exc:
         raise APIError(exc.code, str(exc), exc.status, exc.retryable) from exc
     return ok(_safe_public(result), request, 202 if body.action in {"set_reviewed_params", "queue_reviewed_workflow", "stop_current_job"} else 200)
@@ -345,7 +250,7 @@ def workflow_graph_preview(
     user=Depends(current_user),
 ):
     """Owner-scoped offline graph preview; drafts are read-only and never executable."""
-    wb = _workbench(request, None)
+    wb = _workbench(request)
     try:
         result = wb.get_reviewed_graph(
             user["id"], {"workflow_key": workflow_key, "workflow_version": version, "allow_draft": draft}

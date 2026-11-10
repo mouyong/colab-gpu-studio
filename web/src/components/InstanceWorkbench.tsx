@@ -3,6 +3,7 @@ import { apiMessage, getWorkbench, workbenchAction, type GpuParameter, type Work
 import { getInstanceHistory, type InstanceHistory, type InstanceHistoryJob } from '../lib/instance-history';
 import { formatDuration, formatTiming, timingRows, type TimingDetail } from '../lib/job-history';
 import { jobStageLabel, jobStateLabel } from '../lib/job-stage-rows';
+import { gpuLabel } from '../lib/gpu-label';
 import type { GpuInstance } from './AccountDirectory';
 import { WorkflowGraphPreview, type WorkflowGraphPreviewData } from './WorkflowGraphPreview';
 import styles from './v020.module.css';
@@ -183,7 +184,7 @@ export function InstanceWorkbench({ instance, api, onBack, onQueued }: InstanceW
 
   const historyJobs = history?.jobs || [];
   return <section className={styles.workbench} aria-label="受控实例工作台">
-    <header className={styles.workbenchHeader}><div><p className={styles.eyebrow}>受控工作台</p><h2>{instance.instance_label || instance.label || id}</h2><p className={styles.muted}>{instance.gpu_reported || 'GPU 未确认'} · {instance.state || '状态未知'} · 不暴露 Runtime 凭据</p></div>{onBack && <button type="button" className={styles.buttonSecondary} onClick={onBack}>返回实例</button>}</header>
+    <header className={styles.workbenchHeader}><div><p className={styles.eyebrow}>受控工作台</p><h2>{instance.instance_label || instance.label || id}</h2><p className={styles.muted}>{gpuLabel(instance)} · {instance.state || '状态未知'} · 不暴露 Runtime 凭据</p></div>{onBack && <button type="button" className={styles.buttonSecondary} onClick={onBack}>返回实例</button>}</header>
     {status && <p className={styles.status} role="status">{status}</p>}{error && <p className={styles.error} role="alert">{error}</p>}
     {readOnly && <p className={styles.readOnlyNotice}>此实例处于历史或未验证状态，工作台只读，不会发送真实操作。</p>}
     <div className={styles.healthLine}><span className={`${styles.stateBadge} ${data?.comfy?.verified ? styles.good : ''}`}>Comfy：{data?.comfy?.available ? (data.comfy.verified ? '已验证' : '可用但未验证') : '未确认'}</span><span className={styles.stateBadge}>允许动作：{data?.capabilities?.length || 0}</span></div>

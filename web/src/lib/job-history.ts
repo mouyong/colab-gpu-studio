@@ -1,4 +1,4 @@
-import { jobStageLabel } from './job-stage-rows';
+import { jobStageLabel, jobStageRows } from './job-stage-rows';
 
 export interface TimingDetail { seconds?: number | null; source?: 'events' | 'worker' | string; status?: 'completed' | 'in_progress' | string; }
 
@@ -12,14 +12,17 @@ export interface TimingRow {
 
 export function formatDuration(seconds?: number | null): string {
   if (seconds == null || !Number.isFinite(seconds)) return '—';
-  const rounded = Math.max(0, Math.round(seconds));
-  const hours = Math.floor(rounded / 3600);
-  const minutes = Math.floor((rounded % 3600) / 60);
-  const rest = rounded % 60;
+  const tenths = Math.round(Math.max(0, seconds) * 10);
+  const whole = Math.floor(tenths / 10);
+  const fraction = tenths % 10;
+  const hours = Math.floor(whole / 3600);
+  const minutes = Math.floor((whole % 3600) / 60);
+  const rest = whole % 60;
+  const restText = fraction ? `${rest}.${fraction}` : String(rest);
   const parts: string[] = [];
   if (hours) parts.push(`${hours}小时`);
   if (minutes || hours) parts.push(`${minutes}分`);
-  parts.push(`${rest}秒`);
+  parts.push(`${restText}秒`);
   return parts.join('');
 }
 
@@ -62,5 +65,10 @@ export function timingRows(job: {
       status,
     });
   }
-  return [...rows.values()];
+  const preferred = jobStageRows(Object.fromEntries([...rows.keys()].map((key) => [key, 0]))).map((row) => row.key);
+  const seen = new Set(preferred);
+  return [...preferred, ...[...rows.keys()].filter((key) => !seen.has(key))].flatMap((key) => {
+    const row = rows.get(key);
+    return row ? [row] : [];
+  });
 }

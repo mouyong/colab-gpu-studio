@@ -91,13 +91,8 @@ class GoogleService:
     def _account_matches(self, row: dict, account_id: str | None = None) -> bool:
         account = self.account_id if account_id is None else account_id
         row_account = row.get("account_id")
-        try:
-            from .accounts import AccountService
-
-            owner = row.get("owner_id") or self.owner_id
-            legacy_default = owner and AccountService.default_account_id(owner)
-        except (AttributeError, TypeError, ValueError):
-            legacy_default = None
+        owner = row.get("owner_id") or self.owner_id
+        legacy_default = owner and self._legacy_default_id(owner)
         if account is None:
             return row_account in (None, "", legacy_default)
         if row_account == account:
@@ -115,27 +110,14 @@ class GoogleService:
         the trusted legacy default.  A normal account-specific OAuth app never
         becomes owner-wide through this path.
         """
-        try:
-            from .accounts import AccountService
-
-            default_id = AccountService.default_account_id(owner_id)
-        except (AttributeError, TypeError, ValueError):
-            return False
+        default_id = self._legacy_default_id(owner_id)
         if row.get("account_id") != default_id:
             return False
         from app.oauth_config_routes import config_id
 
         if row.get("id") == config_id(owner_id, default_id):
             return False  # Newly saved dedicated apps are never legacy-shared.
-        accounts = self._list("accounts", owner_id)
-        default = next(
-            (
-                item
-                for item in accounts
-                if item.get("id") == default_id or item.get("account_id") == default_id
-            ),
-            None,
-        )
+        default = self.store.get("accounts", default_id, owner_id)
         return bool(default and (default.get("legacy_default") is True or default.get("legacy_trusted") is True))
 
     def _client_config(self, owner_id: str | None = None, account_id: str | None = None) -> dict | None:
@@ -180,13 +162,10 @@ class GoogleService:
         return {"client_id": str(row.get("client_id", "")).strip(), "client_secret": secret, "id": row.get("id")}
 
     @staticmethod
-    def _legacy_default_id(owner_id: str) -> str | None:
-        try:
-            from .accounts import AccountService
+    def _legacy_default_id(owner_id: str) -> str:
+        from .accounts import AccountService
 
-            return AccountService.default_account_id(owner_id)
-        except (AttributeError, TypeError, ValueError):
-            return None
+        return AccountService.default_account_id(owner_id)
 
     def _config(self, owner_id: str | None = None, account_id: str | None = None) -> tuple[str, str, str]:
         effective_owner = self.owner_id if owner_id is None else owner_id
@@ -210,10 +189,7 @@ class GoogleService:
         return client_id, client_secret, redirect
 
     def _list(self, kind: str, owner_id: str | None = None) -> list[dict]:
-        try:
-            return list(self.store.list(kind, owner_id))
-        except (AttributeError, KeyError, TypeError, ValueError):
-            return []
+        return self.store.list(kind, owner_id)
 
     def _create(self, kind: str, owner_id: str, data: dict) -> dict:
         return self.store.create(kind, owner_id, data)
@@ -221,11 +197,6 @@ class GoogleService:
     def _update(self, kind: str, record_id: str, patch: dict, owner_id: str | None = None) -> dict:
         return self.store.update(kind, record_id, patch, owner_id)
 
-    def _delete(self, kind: str, record_id: str, owner_id: str | None = None) -> bool:
-        try:
-            return bool(self.store.delete(kind, record_id, owner_id))
-        except (AttributeError, KeyError, TypeError, ValueError):
-            return False
 
     def _credential(self, purpose: str, owner_id: str | None = None, account_id: str | None = None) -> dict | None:
         owner = self.owner_id if owner_id is None else owner_id
@@ -500,10 +471,8 @@ class GoogleService:
         except (httpx.HTTPError, KeyError, TypeError, ValueError):
             # Do not include the token or upstream response body in any error.
             remote_confirmed = False
-        if remote_confirmed and self._delete("credentials", credential["id"], self.owner_id):
-            return True
-        # Always remove local bearer material.  A sanitized tombstone records
-        # when the remote endpoint could not be confirmed.
+        # Remove local bearer material and keep a sanitized tombstone that records
+        # whether Google confirmed the revoke.
         self._update(
             "credentials",
             credential["id"],

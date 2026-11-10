@@ -178,44 +178,27 @@ class DriveStorage:
         return folder_id
 
     def _repo_files(self) -> list[dict]:
-        try:
-            return list(self.store.list("files", self.owner_id))
-        except (AttributeError, KeyError, TypeError, ValueError):
-            return []
+        return self.store.list("files", self.owner_id)
 
     def _resolve_storage_account_id(self, candidate: str | None) -> str | None:
-        if not candidate:
-            return candidate
-        try:
-            from .accounts import AccountService
+        from .accounts import AccountService
 
-            return AccountService(self.store, self.owner_id).resolve_drive_account_id(candidate)
-        except Exception:
-            return candidate
+        return AccountService(self.store, self.owner_id).resolve_drive_account_id(candidate)
+
+    def _legacy_account_id(self) -> str:
+        from .accounts import AccountService
+
+        return AccountService.default_account_id(self.owner_id)
 
     def _is_legacy_account(self) -> bool:
         """Whether this storage represents the pre-account default identity."""
-        if self.account_id is None:
-            return True
-        try:
-            from .accounts import AccountService
-
-            return self.account_id == AccountService.default_account_id(self.owner_id)
-        except (AttributeError, TypeError, ValueError):
-            return False
+        return self.account_id is None or self.account_id == self._legacy_account_id()
 
     def _account_matches(self, row: dict) -> bool:
         """Match legacy/default rows without weakening explicit account isolation."""
         row_account = row.get("account_id")
         if self._is_legacy_account():
-            allowed = {None, ""}
-            try:
-                from .accounts import AccountService
-
-                allowed.add(AccountService.default_account_id(self.owner_id))
-            except (AttributeError, TypeError, ValueError):
-                pass
-            return row_account in allowed
+            return row_account in {None, "", self._legacy_account_id()}
         return row_account == self.account_id
 
     def _remember_root(self, remote_id: str) -> None:
@@ -234,20 +217,15 @@ class DriveStorage:
         }
         if self.account_id is not None:
             data["account_id"] = self.account_id
-        try:
-            if rows:
-                self.store.update("files", rows[0]["id"], data, self.owner_id)
-                return
-            root_scope = "legacy" if self._is_legacy_account() else self.account_id
-            record_id = hashlib.sha256(f"drive-root:{self.owner_id}:{root_scope}".encode()).hexdigest()
-            try:
-                self.store.create("files", self.owner_id, data, record_id=record_id)
-            except TypeError:
-                self.store.create("files", self.owner_id, data)
-        except (AttributeError, KeyError, TypeError, ValueError):
-            # The remote root is still usable when a test-only repository has no
-            # files table.  Real Repository persists it through the path above.
+        if rows:
+            self.store.update("files", rows[0]["id"], data, self.owner_id)
             return
+        root_scope = "legacy" if self._is_legacy_account() else self.account_id
+        record_id = hashlib.sha256(f"drive-root:{self.owner_id}:{root_scope}".encode()).hexdigest()
+        try:
+            self.store.create("files", self.owner_id, data, record_id=record_id)
+        except ValueError:
+            pass  # recorded by a concurrent request; the remote root is the same
 
     def _root_folder(self) -> str:
         if self._root_folder_id:
@@ -405,27 +383,17 @@ class DriveStorage:
             and self._account_matches(row)
             and row.get("sha256") == sha256
         ]
+        if rows:
+            self.store.update("files", rows[0]["id"], data, self.owner_id)
+            return
+        file_scope = "legacy" if self._is_legacy_account() else self.account_id
+        record_id = hashlib.sha256(
+            f"drive-file:{self.owner_id}:{file_scope}:{key_hash}:{sha256}".encode()
+        ).hexdigest()
         try:
-            if rows:
-                self.store.update("files", rows[0]["id"], data, self.owner_id)
-                return
-            file_scope = "legacy" if self._is_legacy_account() else self.account_id
-            record_id = hashlib.sha256(
-                f"drive-file:{self.owner_id}:{file_scope}:{key_hash}:{sha256}".encode()
-            ).hexdigest()
-            try:
-                self.store.create("files", self.owner_id, data, record_id=record_id)
-            except TypeError:
-                self.store.create("files", self.owner_id, data)
-        except (AttributeError, KeyError, TypeError) as exc:
-            try:
-                self.store.create("files", self.owner_id, data)
-            except ValueError:
-                if not self._local_match(self._repo_files(), key_hash, sha256, self.account_id):
-                    raise DriveError("Drive本地持久化失败") from exc
-            except (AttributeError, KeyError, TypeError) as nested:
-                raise DriveError("Drive本地持久化失败") from nested
+            self.store.create("files", self.owner_id, data, record_id=record_id)
         except ValueError:
+            # A concurrent upload of the same content already recorded it.
             if not self._local_match(self._repo_files(), key_hash, sha256, self.account_id):
                 raise DriveError("Drive本地持久化失败")
 

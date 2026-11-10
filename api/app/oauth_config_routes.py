@@ -115,15 +115,12 @@ def _effective_config(repo: Repository, owner_id: str, rows: list[dict], account
 def _public(repo: Repository, owner_id: str, account_id: str | None = None) -> dict:
     row = _effective_config(repo, owner_id, _configs(repo, owner_id), account_id)
     if row:
-        try:
-            return {
-                "configured": True,
-                "client_id": row.get("client_id"),
-                "redirect_uri": callback_uri(),
-                "source": "encrypted_database",
-            }
-        except (KeyError, TypeError, ValueError):
-            pass
+        return {
+            "configured": True,
+            "client_id": row.get("client_id"),
+            "redirect_uri": callback_uri(),
+            "source": "encrypted_database",
+        }
     env_id, env_secret = _environment_config()
     return {
         "configured": bool(env_id and env_secret),
@@ -183,16 +180,9 @@ def _invalidate_states_direct(repo: Repository, owner_id: str, account_id: str |
 
 
 def _invalidate_states(repo: Repository, owner_id: str, account_id: str | None, rows: list[dict], shared: bool) -> None:
-    # The account-aware GoogleService method is supplied by the parent change.
-    # Keep a local fallback so this route remains compatible during rollout.
     if not shared and account_id is not None:
-        try:
-            GoogleService(repo, owner_id, account_id=account_id).invalidate_oauth_states(
-                owner_id, account_id=account_id
-            )
-            return
-        except TypeError:
-            pass
+        GoogleService(repo, owner_id, account_id=account_id).invalidate_oauth_states(owner_id, account_id=account_id)
+        return
     _invalidate_states_direct(repo, owner_id, account_id, rows, shared)
 
 

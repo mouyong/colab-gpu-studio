@@ -18,22 +18,7 @@ def _require_account(repo, owner_id: str, account_id: str | None, *, require_all
         return None
     if not isinstance(account_id, str):
         raise APIError("ACCOUNT_INVALID", "account_id必须为字符串", 422)
-    try:
-        account = repo.get("accounts", account_id, owner_id)
-    except (AttributeError, KeyError, TypeError, ValueError):
-        account = None
-    if not account:
-        try:
-            account = next(
-                (
-                    row
-                    for row in repo.list("accounts", owner_id)
-                    if row.get("id") == account_id or row.get("account_id") == account_id
-                ),
-                None,
-            )
-        except (AttributeError, KeyError, TypeError, ValueError):
-            account = None
+    account = repo.get("accounts", account_id, owner_id)
     if not account:
         raise APIError("ACCOUNT_NOT_FOUND", "指定的Google账号不存在或不属于当前用户", 404)
     if account.get("enabled", True) is False or account.get("disabled", False) is True:
@@ -44,15 +29,6 @@ def _require_account(repo, owner_id: str, account_id: str | None, *, require_all
         raise APIError("ACCOUNT_UNAUTHORIZED", "指定账号尚未完成授权", 409)
     return account
 
-
-def _provider(repo, owner_id: str, account_id: str | None):
-    """Construct providers with account binding while tolerating old test doubles."""
-    try:
-        return GoogleColabProvider(repo, owner_id, account_id=account_id)
-    except TypeError as exc:
-        if "account_id" not in str(exc):
-            raise
-        return GoogleColabProvider(repo, owner_id)
 
 
 @router.post("/admin/compute/smoke")
@@ -92,7 +68,7 @@ def cuda_smoke(body: dict, request: Request, user=Depends(current_user), st=Depe
     google = GoogleService(repo, user["id"], account_id=account_id)
     if not google.status()["colab"]["connected"]:
         raise APIError("GOOGLE_NOT_CONNECTED", "请先完成个人 Colab OAuth 授权")
-    specs = _provider(repo, user["id"], account_id).list_specs()
+    specs = GoogleColabProvider(repo, user["id"], account_id=account_id).list_specs()
     eligible = [
         s
         for s in specs

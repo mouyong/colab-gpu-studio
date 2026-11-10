@@ -355,9 +355,25 @@ def workflow_schema(workflow_id: str, request: Request, user=Depends(current_use
 def cloud_sync_workflow(st, owner, row):
     if os.getenv("GPU_STORAGE", "local") != "drive":
         return row
+    from .gpu.accounts import AccountService
     from .gpu.drive import DriveStorage
+    from .gpu.google import GoogleService
 
-    storage = DriveStorage({"owner_id": owner}, Repository(st))
+    repo = Repository(st)
+    storage_job = {"owner_id": owner, "id": row["id"]}
+    if not GoogleService(repo, owner).status()["drive"]["connected"]:
+        service = AccountService(repo, owner)
+        accounts = [
+            account for account in service.list()
+            if account.get("enabled", True)
+            and account.get("authorization", {}).get("drive", {}).get("connected")
+        ]
+        drive_ids = {service.resolve_drive_account_id(account["account_id"]) for account in accounts}
+        if len(drive_ids) != 1:
+            raise APIError("DRIVE_ACCOUNT_REQUIRED", "工作流同步需要唯一的已连接 Drive 账号", 409)
+        account_id = next(iter(drive_ids))
+        storage_job.update(account_id=account_id, drive_account_id=account_id)
+    storage = DriveStorage(storage_job, repo)
     folder = f"workflows/{row['workflow_key']}/{row['workflow_version']}"
     records = {}
     for name, field in [
@@ -446,6 +462,17 @@ def rollback_workflow(body: dict, request: Request, user=Depends(current_user), 
     admin(user)
     _, registry = repo_registry(st, user)
     return ok(registry.rollback(user["id"], body.get("workflow_key"), body.get("version")), request)
+
+
+@router.post("/workflows/{workflow_id}/deactivate")
+def deactivate_workflow(
+    workflow_id: str, body: dict, request: Request, user=Depends(current_user), st=Depends(get_store)
+):
+    admin(user)
+    if not isinstance(body, dict) or body.get("confirmed") is not True:
+        raise APIError("CONFIRMATION_REQUIRED", "停用必须明确confirmed")
+    _, registry = repo_registry(st, user)
+    return ok(registry.deactivate(user["id"], workflow_id), request)
 
 
 @router.get("/presets")

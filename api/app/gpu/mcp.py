@@ -150,7 +150,7 @@ if not _status_path.exists():
 else:
     _status = _json.loads(_status_path.read_text(encoding="utf-8"))
     if isinstance(_status, dict):
-        _result.update({{key: _status.get(key) for key in ("state", "error_code", "error_message", "stage", "timings", "stage_started") if key in _status}})
+        _result.update({{key: _status.get(key) for key in ("state", "error_code", "error_message", "stage", "timings", "stage_started", "gpu_diagnostics") if key in _status}})
     if _result.get("state") == "completed" and _meta_path.exists():
         _meta = _json.loads(_meta_path.read_text(encoding="utf-8"))
         _artifacts = _meta.get("artifacts") if isinstance(_meta, dict) else None
@@ -675,10 +675,15 @@ class MCPGPUExecutor:
         result = self._exec_code_on_handle(handle, session, probe_id, code)
         if not isinstance(result, dict):
             raise MCPError("Colab状态响应无效")
+        if result.get("execution_id") not in {None, execution_id}:
+            raise MCPError("Colab状态执行标识不匹配")
         state = result.get("state", "running")
+        # The scheduler cleans gpu_diagnostics before saving it.
+        evidence = {"execution_id": execution_id, "gpu_diagnostics": result.get("gpu_diagnostics")}
         if state in {"reserved", "starting", "running", None}:
             stage = result.get("stage")
             return {
+                **evidence,
                 "state": "running",
                 "outputs": [],
                 "stage": stage if isinstance(stage, str) else None,
@@ -686,6 +691,7 @@ class MCPGPUExecutor:
             }
         if state == "failed":
             return {
+                **evidence,
                 "state": "failed",
                 "outputs": [],
                 "error_code": result.get("error_code", "gpu_worker_failed"),
@@ -729,7 +735,7 @@ class MCPGPUExecutor:
                         offset = objects.append(key, self.owner_id, execution_id, offset, chunk)
                     local.append(objects.verify(key, self.owner_id, execution_id))
                 artifacts = local
-            return {'state':'completed','execution_id':execution_id,'artifacts':artifacts,
+            return {**evidence, 'state':'completed','artifacts':artifacts,
                     'timings':result.get('timings') or {}}
         outputs = []
         total = 0
@@ -752,7 +758,7 @@ class MCPGPUExecutor:
                 }
             )
         timings = result.get("timings") if isinstance(result.get("timings"), dict) else {}
-        return {"state": "completed", "outputs": outputs, "timings": timings}
+        return {**evidence, "state": "completed", "outputs": outputs, "timings": timings}
 
     def close(self) -> None:
         if self._owns_client:

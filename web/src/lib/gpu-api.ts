@@ -73,6 +73,7 @@ export interface GpuJob {
   instance_label?: string | null;
   instance_state?: string | null;
   gpu_reported?: string | null;
+  runtime_spec_requested?: { accelerator?: string; variant?: string; shape?: string } | null;
   retained_until?: string | null;
   runtime_deleted?: boolean | null;
   stage?: string | null;
@@ -202,13 +203,16 @@ export const importGpuWorkflow = (bundle: WorkflowBundle) => apiFetch<GpuWorkflo
 export const validateGpuWorkflow = (id: string) => apiFetch<GpuWorkflow>(`/api/gpu/workflows/${encodeURIComponent(id)}/validate`, post({}));
 export const publishGpuWorkflow = (id: string) => apiFetch<GpuWorkflow>(`/api/gpu/workflows/${encodeURIComponent(id)}/publish`, post({ confirmed: true }));
 export const rollbackGpuWorkflow = (workflow_key: string, version: string | number) => apiFetch<GpuWorkflow>('/api/gpu/workflows/rollback', post({ workflow_key, version }));
+export const deactivateGpuWorkflow = (id: string) => apiFetch<GpuWorkflow>(`/api/gpu/workflows/${encodeURIComponent(id)}/deactivate`, post({ confirmed: true }));
 
 export type ActivationStep = { key: string; label: string; done: boolean; next?: boolean; running?: boolean; failed?: boolean };
+export type ActivationInput = { key: string; label: string; description?: string; type: string; required: boolean };
 export type WorkflowActivation = {
   workflow: { id: string; workflow_key: string; version: string; state: string; active: boolean };
   model: null | { model_id: string; review_approved: boolean; license_accepted: boolean; enabled: boolean; license?: string; source?: string };
   steps: ActivationStep[];
-  smoke: null | { job_id: string; state: string; error_code?: string; error_message?: string };
+  smoke: null | { job_id: string; project_id?: string | null; state: string; error_code?: string; error_message?: string; max_runtime_minutes?: number | null };
+  required_inputs?: ActivationInput[];
   smoke_job_completed: boolean;
   smoke_kind?: string;
   real_enabled: boolean;

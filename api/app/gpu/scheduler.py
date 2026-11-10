@@ -12,6 +12,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from .colab import ColabAllocationError
 from .compute import (
     ComputeError,
     DisabledProvider,
@@ -85,40 +86,20 @@ class Scheduler:
         instance_service: Any | None = None,
         instance_service_factory: Callable | None = None,
     ):
-        # Base Store owns the database and cross-process lock; GPU records go
-        # through the independent Repository (gpu_jobs, gpu_leases, ...).
-        if hasattr(store, "Session") and hasattr(store, "engine"):
-            from .repository import Repository
+        # Accept either the base Store or the GPU Repository wrapped around it.
+        from .instances import InstanceService
+        from .repository import Repository
 
-            self.db_store = store
-            self.store = Repository(store)
-        elif hasattr(store, "store") and hasattr(store, "list") and hasattr(store, "create"):
-            self.store = store
-            self.db_store = store.store
-        else:
-            self.store = store
-            self.db_store = store
+        self.store = store if isinstance(store, Repository) else Repository(store)
+        self.db_store = self.store.store
         self.config = config or GpuConfig.from_env()
         self.clock = clock or time.time
         if instance_service is not None:
             self.instance_service = instance_service
         elif instance_service_factory is not None:
             self.instance_service = self._factory(instance_service_factory, {})
-        elif not hasattr(self.db_store, "Session"):
-            self.instance_service = None
         else:
-            # v0.2 deployments provide InstanceService; old installations and
-            # lightweight legacy stores intentionally remain scheduler-only.
-            try:
-                from .instances import InstanceService
-            except (ImportError, ModuleNotFoundError):
-                self.instance_service = None
-            else:
-                try:
-                    self.instance_service = InstanceService(self.store, self.clock, self.config)
-                except (TypeError, ValueError, AttributeError):
-                    logging.getLogger(__name__).warning("instance service unavailable; using legacy lease mode")
-                    self.instance_service = None
+            self.instance_service = InstanceService(self.store, self.clock, self.config)
         self.instances = self.instance_service
         self.provider_factory = provider_factory or (
             lambda job: default_provider_factory(
@@ -133,27 +114,12 @@ class Scheduler:
         self.storage_factory = storage_factory
 
     def _instance_call(self, method: str, *args, **kwargs):
-        """Call an optional v0.2 service without weakening legacy compatibility."""
         service = self.instance_service
         if service is None:
             return None
-        if hasattr(service, "clock"):
-            # Scheduler tests and recovery callers may replace ``clock`` after
-            # construction.  InstanceService must use the same deadline
-            # source or a retained instance can be released immediately.
-            service.clock = self.clock
-        target = getattr(service, method, None)
-        if target is None:
-            return None
-        try:
-            return target(*args, **kwargs)
-        except TypeError:
-            # A few offline service doubles expose the same operation with a
-            # narrower signature.  Do not make the scheduler depend on that
-            # test-only detail.
-            if kwargs:
-                return target(*args)
-            raise
+        # Callers may replace ``clock`` after construction; deadlines must share it.
+        service.clock = self.clock
+        return getattr(service, method)(*args, **kwargs)
 
     @staticmethod
     def _instance_id(instance: dict | None) -> str | None:
@@ -164,14 +130,7 @@ class Scheduler:
 
     @staticmethod
     def _instance_epoch(value: Any) -> float | None:
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return float(value)
-        if isinstance(value, str):
-            try:
-                return float(value)
-            except ValueError:
-                return None
-        return None
+        return None if value is None else float(value)
 
     def _instance_patch(self, instance: dict | None) -> dict:
         if not isinstance(instance, dict):
@@ -208,41 +167,16 @@ class Scheduler:
         return self._update("jobs", job["id"], patch, job.get("owner_id"))
 
     def _service_instances(self) -> list[dict]:
-        service = self.instance_service
-        if service is None:
+        if self.instance_service is None:
             return []
-        raw = getattr(service, "instances", None)
-        if isinstance(raw, (list, tuple)):
-            return [dict(item) for item in raw if isinstance(item, dict)]
-        if isinstance(raw, dict):
-            return [dict(item) for item in raw.values() if isinstance(item, dict)]
         owners = {job.get("owner_id") for job in self._list("jobs") if job.get("owner_id")}
-        for name in ("list", "all", "list_instances", "instances"):
-            target = getattr(service, name, None)
-            if target is None or not callable(target):
-                continue
-            collected = []
-            for owner in owners or {None}:
-                try:
-                    result = target(owner) if owner is not None else target()
-                except TypeError:
-                    continue
-                if isinstance(result, dict):
-                    result = result.values()
-                if isinstance(result, (list, tuple)):
-                    collected.extend(item for item in result if isinstance(item, dict))
-            if collected:
-                return collected
-        return []
+        return [item for owner in owners for item in self.instance_service.list(owner)]
 
     def _service_instance_for_job(self, job: dict) -> dict | None:
         instance_id = job.get("instance_id")
-        if not instance_id:
+        if not instance_id or self.instance_service is None:
             return None
-        for instance in self._service_instances():
-            if self._instance_id(instance) == instance_id:
-                return instance
-        return None
+        return self.instance_service.get(job.get("owner_id"), instance_id)
 
     def _lifecycle(self, job: dict) -> str:
         policy = job.get("execution_policy") or {}
@@ -286,10 +220,7 @@ class Scheduler:
 
     def _reuse_instance_lease(self, job: dict, instance: dict | None) -> dict:
         """Retarget a retained lease under the same admission fence as claim/allocate."""
-        lock = getattr(self.db_store, "admission_lock", None)
-        if lock is None:
-            return self._reuse_instance_lease_locked(job, instance)
-        with lock(timeout=1.0) as acquired:
+        with self.db_store.admission_lock(timeout=1.0) as acquired:
             if not acquired:
                 return job
             return self._reuse_instance_lease_locked(job, instance)
@@ -371,28 +302,15 @@ class Scheduler:
             policy = job.get("execution_policy") or {}
             idle_seconds = policy.get("idle_seconds") if policy.get("mode") == "smart" else None
             if idle_seconds is not None:
-                # Legacy batch smart mode specifies seconds, whereas the v0.2
-                # service defaults retention from its config.  Reapply the
-                # legacy duration through the service boundary, never by
-                # editing the instance row behind its CAS/version checks.
-                try:
-                    minutes = float(idle_seconds) / 60.0
-                    target = getattr(self.instance_service, "retention")
-                    self.instance_service.clock = self.clock
-                    retained = target(
-                        job.get("owner_id"),
-                        self._instance_id(instance),
-                        "smart",
-                        minutes,
-                        f"scheduler-smart:{job['id']}",
-                    )
-                except (TypeError, ValueError, AttributeError):
-                    # Narrow legacy service doubles may not expose the v0.2
-                    # retention signature; their completed state remains valid.
-                    pass
-                else:
-                    if isinstance(retained, dict):
-                        instance = retained
+                # Batch smart mode specifies seconds; apply it through the service's CAS path.
+                instance = self._instance_call(
+                    "retention",
+                    job.get("owner_id"),
+                    self._instance_id(instance),
+                    "smart",
+                    float(idle_seconds) / 60.0,
+                    f"scheduler-smart:{job['id']}",
+                )
         job = self._merge_instance(job, instance)
         job = self._update(
             "jobs", job["id"], {"instance_completion_recorded": True}, job.get("owner_id")
@@ -402,9 +320,6 @@ class Scheduler:
     def _record_instance_usage(self, job: dict, instance: dict | None, ended_at: float) -> None:
         """Close one idempotent instance-lifetime segment after remote deletion."""
         if not self._is_v020_job(job):
-            return
-        record_usage = getattr(self.instance_service, "record_usage", None)
-        if not callable(record_usage):
             return
         instance_id = job.get("instance_id") or self._instance_id(instance)
         if not instance_id:
@@ -424,10 +339,7 @@ class Scheduler:
             else 0.0
         )
         is_mock = self._provider_name(job) == "mock"
-        try:
-            rate = float(job.get("unit_rate") or self.config.unit_rate or 0.0)
-        except (TypeError, ValueError):
-            rate = 0.0
+        rate = float(job.get("unit_rate") or self.config.unit_rate or 0.0)
         payload = {
             "instance_id": instance_id,
             "job_id": job.get("id"),
@@ -440,23 +352,16 @@ class Scheduler:
             # Provider billing is not available at deletion time; never invent CU.
             "actual_units": None,
         }
-        record_usage(job.get("owner_id"), payload)
+        self.instance_service.record_usage(job.get("owner_id"), payload)
 
     def _mark_instance_deleted(self, job: dict) -> dict:
         """Record deletion only after the provider has explicitly confirmed it."""
         if not self._is_v020_job(job) or not job.get("instance_id"):
             return job
         try:
-            if hasattr(self.instance_service, "clock"):
-                self.instance_service.clock = self.clock
-            target = getattr(self.instance_service, "mark_deleted")
-            kwargs = {"remote_deleted": True}
-            if job.get("_cleanup_instance_version") is not None:
-                kwargs["expected_version"] = job["_cleanup_instance_version"]
-            instance = target(
-                job.get("owner_id"),
-                job["instance_id"],
-                **kwargs,
+            instance = self._instance_call(
+                "mark_deleted", job.get("owner_id"), job["instance_id"],
+                remote_deleted=True, expected_version=job.get("_cleanup_instance_version"),
             )
             self._record_instance_usage(job, instance, self.clock())
         except Exception as exc:
@@ -468,16 +373,13 @@ class Scheduler:
         return self._merge_instance(job, instance)
 
     def _factory(self, factory: Callable, job: dict):
-        """Allow injected adapters to receive both job and the real base Store."""
+        """Injected adapters take ``job`` and optionally the base Store."""
         import inspect
 
-        try:
-            parameters = inspect.signature(factory).parameters.values()
-            positional = [p for p in parameters if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
-            if any(p.kind == p.VAR_POSITIONAL for p in parameters) or len(positional) >= 2:
-                return factory(job, self.db_store)
-        except (TypeError, ValueError):
-            pass
+        parameters = inspect.signature(factory).parameters.values()
+        positional = [p for p in parameters if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+        if any(p.kind == p.VAR_POSITIONAL for p in parameters) or len(positional) >= 2:
+            return factory(job, self.db_store)
         return factory(job)
 
     def _provider(self, job: dict):
@@ -506,72 +408,26 @@ class Scheduler:
             return job
 
         handle = self._lease_handle(lease)
-        if not isinstance(handle, dict):
-            return job
         cancel_requested = bool(job.get("cancel_requested")) or job.get("requested_outcome") == "cancelled"
         if cancel_requested and job.get("trusted_plugin_cancel_succeeded") is not True:
             try:
                 executor.cancel(handle, job)
+                patch = {"trusted_plugin_cancel_succeeded": True, "trusted_plugin_cancel_error": None}
             except Exception as exc:  # noqa: BLE001 - provider cleanup remains authoritative
-                logging.getLogger(__name__).warning(
-                    "trusted plugin cancel failed: %s", type(exc).__name__
-                )
-                try:
-                    job = self._update(
-                        "jobs",
-                        job["id"],
-                        {"trusted_plugin_cancel_error": "trusted_plugin_cancel_failed"},
-                        job.get("owner_id"),
-                    )
-                except Exception:  # noqa: BLE001 - bookkeeping must not block provider cleanup
-                    logging.getLogger(__name__).warning("could not record trusted plugin cancel failure")
-            else:
-                try:
-                    job = self._update(
-                        "jobs",
-                        job["id"],
-                        {
-                            "trusted_plugin_cancel_succeeded": True,
-                            "trusted_plugin_cancel_error": None,
-                        },
-                        job.get("owner_id"),
-                    )
-                except Exception:  # noqa: BLE001 - bookkeeping must not block provider cleanup
-                    logging.getLogger(__name__).warning("could not persist trusted plugin cancel marker")
+                logging.getLogger(__name__).warning("trusted plugin cancel failed: %s", type(exc).__name__)
+                patch = {"trusted_plugin_cancel_error": "trusted_plugin_cancel_failed"}
+            job = self._update("jobs", job["id"], patch, job.get("owner_id"))
 
         if job.get("trusted_plugin_cleanup_succeeded") is True:
             return job
         try:
             executor.cleanup(handle, job)
+            patch = {"trusted_plugin_cleanup_succeeded": True, "trusted_plugin_cleanup_error": None}
         except Exception as exc:  # noqa: BLE001 - provider cleanup remains authoritative
-            logging.getLogger(__name__).warning(
-                "trusted plugin cleanup failed: %s", type(exc).__name__
-            )
-            try:
-                return self._update(
-                    "jobs",
-                    job["id"],
-                    {"trusted_plugin_cleanup_error": "trusted_plugin_cleanup_failed"},
-                    job.get("owner_id"),
-                )
-            except Exception:  # noqa: BLE001 - bookkeeping must not block provider cleanup
-                logging.getLogger(__name__).warning("could not record trusted plugin cleanup failure")
-                return job
-        try:
-            return self._update(
-                "jobs",
-                job["id"],
-                {
-                    "trusted_plugin_cleanup_succeeded": True,
-                    "trusted_plugin_cleanup_error": None,
-                },
-                job.get("owner_id"),
-            )
-        except Exception:  # noqa: BLE001 - bookkeeping must not block provider cleanup
-            logging.getLogger(__name__).warning("could not persist trusted plugin cleanup marker")
-            return job
+            logging.getLogger(__name__).warning("trusted plugin cleanup failed: %s", type(exc).__name__)
+            patch = {"trusted_plugin_cleanup_error": "trusted_plugin_cleanup_failed"}
+        return self._update("jobs", job["id"], patch, job.get("owner_id"))
 
-    # Store/Repository compatibility surface.
     def _list(self, kind: str, owner_id: str | None = None) -> list[dict]:
         return list(self.store.list(kind, owner_id=owner_id))
 
@@ -585,9 +441,7 @@ class Scheduler:
         return self.store.update(kind, record_id, patch, owner_id=owner_id)
 
     def _event(self, job: dict, state: str, message: str, progress: float | None = None) -> None:
-        event = getattr(self.store, "event", None)
-        if event:
-            event(job["id"], job.get("owner_id"), state, message, progress)
+        self.store.event(job["id"], job.get("owner_id"), state, message, progress)
 
     def _set_state(self, job: dict, state: str, message: str, **patch) -> dict:
         if state in TERMINAL_STATES:
@@ -597,20 +451,10 @@ class Scheduler:
                 return current
         if job.get("prep"):
             message = _PREP_TEXT.get(message, message.replace("GPU", "CPU"))
-        transition = getattr(self.store, 'transition_job', None)
-        if transition:
-            return transition(job['id'],job.get('owner_id'),state,message,patch,self.clock(),expected_state=job.get('state'),expected_execution_id=job.get('execution_id'))
-        updated = self._update("jobs", job["id"], {"state": state, **patch}, job.get("owner_id"))
-        execution_id = updated.get('execution_id')
-        if execution_id and updated.get('batch_id') and state in TERMINAL_STATES | {'running', 'uploading'}:
-            execution = self._get('executions', execution_id, updated.get('owner_id'))
-            if execution:
-                execution_patch = {'state': state}
-                if state in TERMINAL_STATES:
-                    execution_patch.update(finished_at=self.clock(), error_code=updated.get('error_code'))
-                self._update('executions', execution_id, execution_patch, updated.get('owner_id'))
-        self._event(updated, state, message, patch.get("progress"))
-        return updated
+        return self.store.transition_job(
+            job["id"], job.get("owner_id"), state, message, patch, self.clock(),
+            expected_state=job.get("state"), expected_execution_id=job.get("execution_id"),
+        )
 
     def _provider_name(self, job: dict) -> str:
         return job.get("provider") or (job.get("execution_policy") or {}).get("provider", "mock")
@@ -725,16 +569,10 @@ class Scheduler:
             return False
         drive_account_id = job.get("drive_account_id")
         if not drive_account_id and job.get("account_id"):
-            try:
-                from .accounts import AccountService
+            from .accounts import AccountService
 
-                drive_account_id = AccountService(self.store, job["owner_id"]).resolve_drive_account_id(job.get("account_id"))
-            except Exception:
-                drive_account_id = job.get("account_id")
-        try:
-            preps = prep_jobs_for(self.store, job["owner_id"], snapshot, drive_account_id=drive_account_id)
-        except TypeError:
-            preps = prep_jobs_for(self.store, job["owner_id"], snapshot)
+            drive_account_id = AccountService(self.store, job["owner_id"]).resolve_drive_account_id(job["account_id"])
+        preps = prep_jobs_for(self.store, job["owner_id"], snapshot, drive_account_id=drive_account_id)
         done = next((p for p in preps if p["state"] == "completed"), None)
         if done:
             if done["id"] == job.get("prep_job_id") and job.get("prep_seconds") is None:
@@ -831,10 +669,7 @@ class Scheduler:
         if handle.get("job_id") == owner and handle.get("owner_job_id") == owner:
             return handle
         fixed = {**handle, "job_id": owner, "owner_job_id": owner}
-        try:
-            self._update("leases", lease["id"], {"handle": fixed}, lease.get("owner_id"))
-        except Exception:
-            logging.getLogger(__name__).warning("could not persist re-owned lease handle")
+        self._update("leases", lease["id"], {"handle": fixed}, lease.get("owner_id"))
         return fixed
 
     def _intent_handle(self, job: dict, lease: dict) -> dict | None:
@@ -863,106 +698,46 @@ class Scheduler:
         return handle
 
     @staticmethod
-    def _value(value: Any, *keys: str) -> Any:
-        if isinstance(value, dict):
-            for key in keys:
-                if key in value:
-                    return value[key]
-        return None
-
-    def _manifest_runtime(self, job: dict) -> str | None:
-        manifest = (job.get("snapshot") or {}).get("manifest")
-        value = self._value(
-            manifest, "runtime", "runtime_key", "runtime_id", "runtime_version", "colab_runtime"
-        )
-        if isinstance(value, dict):
-            value = self._value(value, "name", "key", "id", "version")
-        return value if isinstance(value, str) and value else None
-
-    def _spec_key(self, spec: dict) -> str | None:
-        value = self._value(spec, "key", "name", "id", "spec_id")
-        if value is None and isinstance(spec.get("runtimeSpec"), dict):
-            value = self._value(spec["runtimeSpec"], "key", "name", "id")
+    def _spec_key(spec: dict) -> str | None:
+        """Colab runtimespecs are identified by their ``key`` (variant/accelerator/shape)."""
+        value = spec.get("key")
         if isinstance(value, dict):
             return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        return value if isinstance(value, str) and value else None
+        return value or None
 
-    def _spec_runtime(self, spec: dict) -> str | None:
-        value = self._value(spec, "runtime", "runtime_key", "runtime_id", "runtime_version", "colab_runtime")
-        if isinstance(value, dict):
-            value = self._value(value, "name", "key", "id", "version")
-        if value is None and isinstance(spec.get("runtimeSpec"), dict):
-            value = self._value(spec["runtimeSpec"], "runtime", "runtime_key", "runtime_id", "version")
-        return value if isinstance(value, str) and value else None
-
-    def _has_gpu(self, spec: dict) -> bool:
-        # Official enum is authoritative; do not infer new GPUs from model names.
+    @staticmethod
+    def _has_gpu(spec: dict) -> bool:
         key = spec.get("key")
-        if isinstance(key, dict) and "variant" in key:
-            return key["variant"] in {"GPU", "VARIANT_GPU"}
-        for key in ("gpu", "has_gpu", "accelerator", "accelerator_type", "acceleratorType", "device"):
-            value = spec.get(key)
-            if value is True:
-                return True
-            if isinstance(value, str) and "gpu" in value.lower():
-                return True
-            if isinstance(value, dict) and any(str(v).lower() == "gpu" for v in value.values()):
-                return True
-        text = json.dumps(spec, ensure_ascii=False).lower()
-        return any(token in text for token in ("t4", "l4", "a100", "v100", "p100", "h100"))
-
-    def _known_vram(self, spec: dict) -> bool:
-        for key in ("vram_gb", "vram", "memory_gb", "gpu_memory_gb"):
-            value = spec.get(key)
-            if isinstance(value, (int, float)) and value > 0:
-                return True
-        for value in spec.values():
-            if isinstance(value, dict) and self._known_vram(value):
-                return True
-        return False
+        return isinstance(key, dict) and key.get("variant") in {"GPU", "VARIANT_GPU"}
 
     def _select_spec(self, job: dict, provider: Any) -> dict:
         try:
             specs = provider.list_specs()
         except Exception as exc:
             raise ComputeError(self._safe_error(exc)) from exc
-        if not isinstance(specs, list):
-            raise ComputeError("GPU runtime规格响应无效")
         requested = job.get("requested_spec") or (job.get("execution_policy") or {}).get("requested_spec")
         requested_key = requested if isinstance(requested, str) else self._spec_key(requested or {})
-        manifest_runtime = self._manifest_runtime(job)
         snapshot = job.get("snapshot") or {}
         smoke = snapshot.get("system_smoke") is True
         prep = snapshot.get("prep") is True
-        # 官方 runtimespecs 只返回 key(variant/accelerator/shape)，没有 runtime 版本或显存字段。
-        # 经审查的工作流在 manifest.compute_spec 里写明已冒烟验证过的规格 key，
-        # 普通任务只允许这个规格；管理员真实冒烟任务则按其请求的规格 key 运行。
+        # 官方 runtimespecs 只返回 key(variant/accelerator/shape)。经审查的工作流在
+        # manifest.compute_spec 写明已验证过的规格；普通任务只允许这个规格，
+        # 管理员冒烟任务按其请求的规格运行，缓存准备只用固定的 CPU 规格。
         reviewed_key = self._spec_key({"key": (snapshot.get("manifest") or {}).get("compute_spec")})
-        if prep:  # cache prep never needs a GPU: only the fixed CPU spec is allowed
+        if prep:
             requested_key = reviewed_key = self._spec_key({"key": PREP_SPEC_KEY})
-        if requested_key is None and reviewed_key is not None:
+        if requested_key is None:
             requested_key = reviewed_key
-        trusted = smoke or snapshot.get("workflow_smoke") is True or reviewed_key is not None
+        if not (smoke or snapshot.get("workflow_smoke") is True or reviewed_key is not None):
+            raise ComputeError("没有符合工作流runtime的GPU规格")
         if smoke and requested_key is None:
             raise ComputeError("system smoke必须绑定已选择的GPU规格")
-        eligible = []
         for spec in specs:
-            if not isinstance(spec, dict) or spec.get("eligible") is not True or self._has_gpu(spec) == prep:
+            if spec.get("eligible") is not True or self._has_gpu(spec) == prep:
                 continue
-            key = self._spec_key(spec)
-            if requested_key is not None and key != requested_key:
-                continue
-            runtime = self._spec_runtime(spec)
-            if manifest_runtime is not None and runtime != manifest_runtime:
-                continue
-            if manifest_runtime is None and not trusted:
-                continue
-            if not trusted and not self._known_vram(spec) and key not in self.config.spec_allowlist:
-                continue
-            eligible.append(spec)
-        if not eligible:
-            raise ComputeError("没有符合工作流runtime的GPU规格")
-        return eligible[0]
+            if requested_key is None or self._spec_key(spec) == requested_key:
+                return spec
+        raise ComputeError("没有符合工作流runtime的GPU规格")
 
     def _recover_unknown_create(self, job: dict, lease: dict, provider: Any) -> str | bool:
         """Reconcile a create that may have succeeded before its response was lost."""
@@ -970,8 +745,8 @@ class Scheduler:
         if handle is None:
             return False
         try:
-            if getattr(provider,'is_mock',False) and hasattr(provider,'recover_handle'):
-                handle=provider.recover_handle(handle)
+            if hasattr(provider, "recover_handle"):
+                handle = provider.recover_handle(handle)
             status = provider.inspect(handle)
         except Exception as exc:
             self._update(
@@ -1018,6 +793,8 @@ class Scheduler:
             lease = self._ensure_lease(job)
         if job.get("lease_id") != lease["id"]:
             job = self._update("jobs", job["id"], {"lease_id": lease["id"]}, job.get("owner_id"))
+        if lease.get("state") in {"cleanup_pending", "releasing", "deleting", "quarantined", "deleted"}:
+            return self._begin_failure(job, "gpu_allocation_aborted", "GPU allocation entered cleanup before execution; retry after release")
         try:
             job, lease = self._bind_instance_lease(job, lease)
         except SchedulerError as exc:
@@ -1059,8 +836,8 @@ class Scheduler:
             handle = provider.create(spec, lease["request_id"], job["id"], lease["runtime_id"])
             if not isinstance(handle, dict) or not handle.get("runtime_name"):
                 raise ComputeError("provider returned an unknown runtime handle")
-            if getattr(provider,'is_mock',False) and hasattr(provider,'bind_owner'):
-                handle=provider.bind_owner(handle,job.get('owner_id'))
+            if hasattr(provider, "bind_owner"):
+                handle = provider.bind_owner(handle, job.get("owner_id"))
             handle = {
                 **handle,
                 "runtime_id": lease["runtime_id"],
@@ -1071,6 +848,8 @@ class Scheduler:
             }
         except ProviderUnavailable as exc:
             return self._begin_failure(job, "gpu_provider_unavailable", self._safe_error(exc))
+        except ColabAllocationError as exc:
+            return self._allocation_failed(job, exc)
         except Exception:
             recovered = self._recover_unknown_create(job, lease, provider)
             if recovered == "cleaned":
@@ -1120,6 +899,10 @@ class Scheduler:
             job, "failed", message, requested_outcome="failed", error_code=code, error_message=message
         )
 
+    def _allocation_failed(self, job: dict, exc: ColabAllocationError) -> dict:
+        code = "gpu_capacity_unavailable" if exc.reason == "NO_RUNTIMES" else "gpu_allocation_failed"
+        return self._begin_failure(job, code, str(exc))
+
     def _expired(self, job: dict) -> bool:
         lease = self._lease(job)
         deadline = job.get("deadline_epoch") or (lease or {}).get("deadline_epoch")
@@ -1133,6 +916,9 @@ class Scheduler:
             status = self._provider(job).inspect(self._lease_handle(lease))
         except Exception as exc:
             return self._begin_failure(job, "gpu_runtime_inspect_failed", self._safe_error(exc))
+        if status.get("allocation_failed"):
+            return self._allocation_failed(job, ColabAllocationError(
+                status.get("allocation_error_code"), status.get("allocation_failure_reason")))
         if status.get("deleted"):
             return self._begin_failure(job, "gpu_runtime_missing", "GPU runtime disappeared")
         if status.get("ready"):
@@ -1149,22 +935,13 @@ class Scheduler:
             execution=self._get('executions',execution_id,job.get('owner_id'))
             if not execution or execution.get('state')!='starting':
                 return self._set_state(job, "running", "GPU execution recovered")
-        prepare=getattr(self.store,'prepare_execution',None)
-        if prepare:
-            job=prepare(job['id'],job['owner_id'],lease['id'],self.clock())
-            execution_id=job['execution_id']
-        else:
-            execution_id = str(uuid.uuid4())
-            job = self._update('jobs',job['id'],{'execution_id':execution_id},job.get('owner_id'))
-        if self._is_v020_job(job) and job.get("instance_id"):
-            execution = self._get("executions", execution_id, job.get("owner_id"))
-            if execution and execution.get("instance_id") != job["instance_id"]:
-                self._update(
-                    "executions",
-                    execution_id,
-                    {"instance_id": job["instance_id"], "account_id": job.get("account_id")},
-                    job.get("owner_id"),
-                )
+        try:
+            job = self.store.prepare_execution(job["id"], job["owner_id"], lease["id"], self.clock())
+        except (KeyError, ValueError) as exc:
+            # prepare_execution raises these only with its own fixed identity-check messages.
+            # The lease is owned by this job (see _lease), so cleaning it up here is safe.
+            return self._begin_failure(job, "gpu_execution_prepare_failed", f"Execution registration refused: {exc}")
+        execution_id = job["execution_id"]
         try:
             # The Drive token is attached to an in-memory copy only; it is never persisted.
             executor_job = {
@@ -1188,13 +965,9 @@ class Scheduler:
         """Remember on the lease which environment the runtime now has, and whether this job reused it."""
         signature = job.get("compatibility_signature")
         skipped = "warm_reuse" in timings
-        try:
-            if signature and lease.get("restored_signature") != signature:
-                self._update("leases", lease["id"], {"restored_signature": signature}, job.get("owner_id"))
-            return self._update("jobs", job["id"], {"restore_skipped": skipped}, job.get("owner_id"))
-        except Exception:  # noqa: BLE001 - bookkeeping must never fail a finished job
-            logging.getLogger(__name__).warning("could not record restored environment")
-            return job
+        if signature and lease.get("restored_signature") != signature:
+            self._update("leases", lease["id"], {"restored_signature": signature}, job.get("owner_id"))
+        return self._update("jobs", job["id"], {"restore_skipped": skipped}, job.get("owner_id"))
 
     def _model_cache(self, job: dict) -> dict | None:
         """Drive cache for reviewed model weights; None means download from Hugging Face."""
@@ -1239,6 +1012,8 @@ class Scheduler:
             job = self._set_state(job, 'running', 'GPU connection recovered', poll_retry_count=0, poll_retry_at=0)
         if result.get('execution_id') not in {None,job.get('execution_id')}:
             return self._begin_failure(job,'gpu_execution_id_mismatch','poll execution identity mismatch')
+        if result.get("gpu_diagnostics") and not job.get("gpu_reported"):
+            job = self.store.record_gpu_diagnostics(job, result["gpu_diagnostics"]) or job
         state = result.get("state")
         timings = result.get("timings") if isinstance(result.get("timings"), dict) else None
         if state == "completed":
@@ -1326,30 +1101,27 @@ class Scheduler:
             "model_revision": snapshot.get("model_revision"),
             "resolved_params": snapshot.get("resolved_params", {}),
             "system_smoke": snapshot.get("system_smoke") is True,
+            "gpu_reported": job.get("gpu_reported"),
+            "gpu_diagnostics": job.get("gpu_diagnostics"),
         }
 
-    def _write_local_metadata(self, job: dict, metadata: dict) -> dict | None:
-        try:
-            from app.config import settings
+    def _write_local_metadata(self, job: dict, metadata: dict) -> dict:
+        from app.config import settings
 
-            root = (Path(settings.data_dir) / "gpu-results" / job["owner_id"] / job["id"]).resolve()
-            root.mkdir(parents=True, exist_ok=True)
-            target = root / "metadata.json"
-            content = json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
-            tmp = target.with_suffix(".partial")
-            tmp.write_bytes(content)
-            tmp.replace(target)
-            if target.read_bytes() != content:
-                raise OSError("metadata verification failed")
-            return {
-                "filename": "metadata.json",
-                "storage_key": str(target),
-                "sha256": hashlib.sha256(content).hexdigest(),
-                "mime": "application/json",
-                "metadata": metadata,
-            }
-        except (ImportError, OSError, ValueError):
-            return None
+        root = Path(settings.data_dir) / "gpu-results" / job["owner_id"] / job["id"]
+        root.mkdir(parents=True, exist_ok=True)
+        target = root / "metadata.json"
+        content = json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        tmp = target.with_suffix(".partial")
+        tmp.write_bytes(content)
+        tmp.replace(target)
+        return {
+            "filename": "metadata.json",
+            "storage_key": str(target),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "mime": "application/json",
+            "metadata": metadata,
+        }
 
     def _upload(self, job: dict) -> dict:
         outputs, assets = job.get("outputs") or [], []
@@ -1363,10 +1135,6 @@ class Scheduler:
         else:
             storage = None
         result_metadata = self._result_metadata(job)
-        if result_metadata["system_smoke"]:
-            result_metadata["system_smoke"] = True
-        if report is not None:
-            result_metadata["prep_report"] = report
         metadata_record = None
         try:
             if job.get('prep'):
@@ -1408,42 +1176,18 @@ class Scheduler:
                     )
                     if not storage.verify(cloud_record, bytes(content)):
                         raise ComputeError("stored GPU output failed verification")
-                    try:
-                        from app.storage import save_asset
-                    except (ImportError, ModuleNotFoundError):
-                        record = cloud_record
-                    else:
-                        record = save_asset(
-                            self.db_store,
-                            job["owner_id"],
-                            job.get("project_id"),
-                            bytes(content),
-                            output.get("filename", "output"),
-                            job["id"],
-                            {**metadata, "cloud_record": cloud_record},
-                        )
-                else:
-                    try:
-                        from app.storage import save_asset
-                    except (ImportError, ModuleNotFoundError):
-                        record = {
-                            "id": f"gpu-{job['id']}-{index}",
-                            "filename": output.get("filename"),
-                            "mime": output.get("mime"),
-                            "metadata": metadata,
-                            "content_b64": base64.b64encode(bytes(content)).decode(),
-                        }
-                    else:
-                        record = save_asset(
-                            self.db_store,
-                            job["owner_id"],
-                            job.get("project_id"),
-                            bytes(content),
-                            output.get("filename", "output"),
-                            job["id"],
-                            metadata,
-                        )
-                assets.append(record)
+                    metadata = {**metadata, "cloud_record": cloud_record}
+                from app.storage import save_asset
+
+                assets.append(save_asset(
+                    self.db_store,
+                    job["owner_id"],
+                    job.get("project_id"),
+                    bytes(content),
+                    output.get("filename", "output"),
+                    job["id"],
+                    metadata,
+                ))
             metadata_content = json.dumps(
                 result_metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")
             ).encode()
@@ -1511,9 +1255,9 @@ class Scheduler:
         return patch
 
     def _record_usage(self, job: dict, lease: dict, stopped_at: float) -> None:
-        if self._list("usage", job.get("owner_id")):
-            if any(row.get("job_id") == job.get("id") and row.get('execution_id')==job.get('execution_id') for row in self._list("usage", job.get("owner_id"))):
-                return
+        if any(row.get("job_id") == job.get("id") and row.get("execution_id") == job.get("execution_id")
+               for row in self._list("usage", job.get("owner_id"))):
+            return
         started = float(job.get("started_epoch") or lease.get("created_epoch") or stopped_at)
         elapsed_minutes = max(0.0, stopped_at - started) / 60.0
         is_mock = self._provider_name(job) == "mock"
@@ -1548,11 +1292,7 @@ class Scheduler:
             "simulated": is_mock,
             "simulated_units": float(job.get("simulated_units") or 0),
         }
-        record_usage=getattr(self.store,'record_usage_once',None)
-        if record_usage:
-            record_usage(job['owner_id'],payload)
-        else:
-            self._create("usage", job["owner_id"], payload)
+        self.store.record_usage_once(job["owner_id"], payload)
         self._update(
             "jobs",
             job["id"],
@@ -1565,6 +1305,13 @@ class Scheduler:
             job.get("owner_id"),
         )
 
+    def _finish_cleanup(self, job: dict, state: str, message: str, **patch) -> dict:
+        if state in {"completed", "cancelled"} and job.get("error_code") in {
+            "gpu_cleanup_pending", "gpu_instance_completion_pending",
+        }:
+            patch.update(error_code=None, error_message=None)
+        return self._set_state(job, state, message, cleanup_next_epoch=0, **patch)
+
     def _cleanup(self, job: dict) -> dict:
         lease = self._lease(job)
         job = self._trusted_plugin_cleanup(job, lease)
@@ -1574,7 +1321,7 @@ class Scheduler:
                        and j["id"] != job["id"] and not j.get("cancel_requested")]
             waiting.sort(key=lambda j: j.get("queue_order", 0))
             next_job = waiting[0] if waiting else None
-            if next_job and hasattr(self.store,'handoff_lease'):
+            if next_job:
                 with self.db_store.dispatch_lock() as acquired:
                     if not acquired:
                         return job
@@ -1591,8 +1338,8 @@ class Scheduler:
                     job,
                     "cleanup_pending",
                     "GPU instance completion is pending",
-                    error_code="gpu_instance_completion_pending",
-                    error_message=str(exc),
+                    error_code=job.get("error_code") or "gpu_instance_completion_pending",
+                    error_message=job.get("error_message") or str(exc),
                 )
             if isinstance(instance, dict) and instance.get("state") == "retained_idle":
                 if lease:
@@ -1609,7 +1356,7 @@ class Scheduler:
                         {"state": "completed", "finished_at": self.clock()},
                         job.get("owner_id"),
                     )
-                return self._set_state(
+                return self._finish_cleanup(
                     job,
                     final_state,
                     "GPU cleanup completed; instance retained",
@@ -1631,10 +1378,10 @@ class Scheduler:
                     self._update('executions',job['execution_id'],{'state':'completed','finished_at':self.clock()},job['owner_id'])
                 return self._set_state(job,'completed','Mock outputs verified; idle lease retained')
         if not lease:
-            return self._set_state(job, final_state, "GPU cleanup completed")
+            return self._finish_cleanup(job, final_state, "GPU cleanup completed")
         if lease.get("state") == "deleted":
             self._record_usage(job, lease, self.clock())
-            return self._set_state(job, final_state, "GPU cleanup completed")
+            return self._finish_cleanup(job, final_state, "GPU cleanup completed")
         next_epoch = float(lease.get("cleanup_next_epoch") or 0)
         if self.clock() < next_epoch:
             return job
@@ -1695,7 +1442,7 @@ class Scheduler:
                 "GPU cleanup is pending",
                 cleanup_attempts=attempts,
                 cleanup_next_epoch=self.clock() + delay,
-                error_code="gpu_cleanup_pending",
+                error_code=job.get("error_code") or "gpu_cleanup_pending",
             )
         self._update(
             "leases",
@@ -1706,7 +1453,7 @@ class Scheduler:
             job.get("owner_id"),
         )
         self._record_usage(job, lease, self.clock())
-        return self._set_state(job, final_state, "GPU cleanup completed")
+        return self._finish_cleanup(job, final_state, "GPU cleanup completed")
 
     def _advance(self, job: dict) -> dict:
         state = job.get("state")
@@ -1750,7 +1497,7 @@ class Scheduler:
                 job = self._reuse_instance_lease(allocated, allocated)
                 if not job.get("instance_id"):
                     return job
-            elif job.get('compatibility_signature') and hasattr(self.store,'attach_idle_lease'):
+            elif job.get('compatibility_signature'):
                 with self.db_store.dispatch_lock() as acquired:
                     if not acquired:
                         return job
@@ -1868,19 +1615,12 @@ class Scheduler:
             return False
 
         token = uuid.uuid4().hex
-        claim_method = getattr(self.store, "claim_orphan_lease", None)
-        if not callable(claim_method):
-            claim_method = None
-        try:
-            durable_instance = self._get("instances", instance_id, owner_id) if instance_id else None
-        except TypeError:
-            # Narrow legacy store doubles may not accept owner_id as a keyword.
-            durable_instance = self.store.get("instances", instance_id) if instance_id else None
+        durable_instance = self._get("instances", instance_id, owner_id) if instance_id else None
         # Retained-idle cleanup is a normal lease-expiry path, not an orphan
         # claim.  claim_orphan_lease deliberately rejects retained_idle so a
         # concurrent allocation cannot be mistaken for an orphan.
-        use_claim = claim_method and instance_id and durable_instance is not None and lease.get("state") != "idle"
-        claimed = claim_method(owner_id, lease["id"], instance_id, token, self.clock()) if use_claim else None
+        use_claim = durable_instance is not None and lease.get("state") != "idle"
+        claimed = self.store.claim_orphan_lease(owner_id, lease["id"], instance_id, token, self.clock()) if use_claim else None
         if use_claim and not claimed:
             return False
         if claimed:
@@ -1930,13 +1670,13 @@ class Scheduler:
 
         try:
             provider = self._provider(job)
-            if getattr(provider, "is_mock", False) and hasattr(provider, "recover_handle"):
+            if hasattr(provider, "recover_handle"):
                 handle = provider.recover_handle(handle)
             status = provider.inspect(handle)
             confirmed = bool(status.get("deleted"))
-            # A legacy/non-SQL test double has no durable claim.  Recheck at the
-            # final pre-delete boundary; SQL callers are fenced by claim state.
-            if not confirmed and instance_id and any(
+            # Without a durable instance claim nothing fences a new lease on the
+            # same instance, so recheck right before the remote delete.
+            if not confirmed and not claimed and instance_id and any(
                 other.get("id") != lease.get("id")
                 and other.get("instance_id") == instance_id
                 and self._lease_blocks(other)
@@ -2049,42 +1789,30 @@ class Scheduler:
     def _cleanup_historical_orphan_instance(self, instance: dict, lease: dict, leases: list[dict], jobs: list[dict]) -> bool:
         """Inspect, then persist deletion, for a legacy lease missing provenance."""
         now = self.clock()
-        for row in (instance, lease):
-            retry_at = row.get("cleanup_next_epoch")
-            if retry_at is None:
-                continue
-            try:
-                if float(now) < float(retry_at):
-                    return False
-            except (TypeError, ValueError):
-                return False
+        if any(now < float(row.get("cleanup_next_epoch") or 0) for row in (instance, lease)):
+            return False
         evidence = self._historical_orphan_evidence(instance, lease, leases, jobs)
         if evidence is None:
             return False
-        claim = getattr(self.store, "claim_orphan_instance", None)
-        finish = getattr(self.store, "finish_orphan_instance", None)
-        if not callable(claim) or not callable(finish):
-            return False
         token = uuid.uuid4().hex
-        claimed = claim(instance["owner_id"], self._instance_id(instance), lease["id"], token, self.clock())
+        claimed = self.store.claim_orphan_instance(instance["owner_id"], self._instance_id(instance), lease["id"], token, self.clock())
         if not claimed:
             return False
         claim_instance, claim_lease = claimed
         job, handle = evidence
         try:
             provider = self._provider(job)
-            if getattr(provider, "is_mock", False) and hasattr(provider, "recover_handle"):
+            if hasattr(provider, "recover_handle"):
                 handle = provider.recover_handle(handle)
             status = provider.inspect(handle)
             confirmed = (
-                isinstance(status, dict)
-                and status.get("deleted") is True
+                status.get("deleted") is True
                 and not any(status.get(key) for key in ("allocation_unknown", "operation_pending", "ambiguous", "pending"))
             )
             error = None if confirmed else "remote deletion not unambiguously confirmed"
         except Exception as exc:
             confirmed, error = False, self._safe_error(exc)
-        return bool(finish(
+        return bool(self.store.finish_orphan_instance(
             instance["owner_id"], self._instance_id(instance), lease["id"], token, self.clock(),
             confirmed=confirmed, error=error, expected_version=claim_instance.get("version"),
             expected_lease_version=claim_lease.get("version"),

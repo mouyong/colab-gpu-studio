@@ -12,7 +12,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app import db as db_module
-from app.db import Base, CommonMixin, Store, utcnow
+from app.db import Base, CommonMixin, Store, utc_isoformat, utcnow
 
 from .manifest import digest
 
@@ -201,8 +201,6 @@ def ensure_schema(store: Store) -> None:
 
 def retarget_handle(handle, job_id):
     """Return the runtime handle re-owned by job_id (providers check handle ownership against the lease owner)."""
-    if not isinstance(handle, dict):
-        return handle
     return {**handle, 'job_id': job_id, 'owner_job_id': job_id}
 
 
@@ -235,8 +233,8 @@ class Repository:
             "id": row.id,
             "owner_id": row.owner_id,
             "project_id": row.project_id,
-            "created_at": row.created_at.isoformat() if row.created_at else None,
-            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+            "created_at": utc_isoformat(row.created_at),
+            "updated_at": utc_isoformat(row.updated_at),
         }
         result.update({k: copy.deepcopy(v) for k, v in (row.data or {}).items() if k not in reserved})
         # v0.2 stores identity in typed columns as well as JSON.  Old rows may
@@ -263,8 +261,6 @@ class Repository:
 
     def create(self, kind, owner_id, data, project_id=None, record_id=None):
         model = self._model(kind)
-        if not isinstance(data, Mapping):
-            raise ValueError("GPU记录data必须是对象")  # noqa: TRY004
         payload = copy.deepcopy(dict(data))
         rid = record_id or str(uuid.uuid4())
         effective_project = project_id if project_id is not None else payload.get("project_id")
@@ -337,10 +333,33 @@ class Repository:
                 stmt = stmt.where(model.project_id == project_id)
             return [self._row(row) for row in session.scalars(stmt).all()]
 
+    def record_gpu_diagnostics(self, job, diagnostics):
+        """Save worker-measured devices on the running job, its lease and instance."""
+        from .diagnostics import gpu_diagnostics
+
+        clean = gpu_diagnostics(diagnostics)
+        if clean is None:
+            return None
+        patch = {"gpu_diagnostics": clean, "gpu_reported": ", ".join(d["name"] for d in clean["devices"])}
+        owner_id = job["owner_id"]
+        with self.store.db_lock(), self.store.Session.begin() as session:
+            row = session.get(GpuJobRow, job["id"])
+            if row is None or row.owner_id != owner_id or row.state != "running":
+                return None
+            rows = [row]
+            for model, key in ((GpuLeaseRow, "lease_id"), (GpuInstanceRow, "instance_id")):
+                related = session.get(model, job.get(key)) if job.get(key) else None
+                if related is not None and related.owner_id == owner_id and related.state != "deleted":
+                    rows.append(related)
+            for item in rows:
+                item.data = {**(item.data or {}), **copy.deepcopy(patch)}
+                item.version += 1
+                item.updated_at = utcnow()
+            session.flush()
+            return self._row(row)
+
     def update(self, kind, id, patch, owner_id=None):
         model = self._model(kind)
-        if not isinstance(patch, Mapping):
-            raise ValueError("patch必须是对象")  # noqa: TRY004
         with self.store.db_lock(), self.store.Session.begin() as session:
             stmt = select(model).where(model.id == id)
             if owner_id is not None:
@@ -380,10 +399,6 @@ class Repository:
             return self._row(row)
 
     def create_job(self, owner_id, body, idempotency_key, *, admitted=None):
-        if not isinstance(body, Mapping):
-            raise ValueError("job body必须是对象")  # noqa: TRY004
-        if not isinstance(idempotency_key, str) or not idempotency_key:
-            raise ValueError("idempotency_key必填")
         raw = copy.deepcopy(dict(body))
         body_hash = digest(raw)
         for attempt in range(8):
@@ -1171,6 +1186,7 @@ class Repository:
                 'requested_instance_id',
                 'account_alias_snapshot','selection_reason','allocation_key','attempt_id','runtime_id','request_id',
                 'stage','worker_timings','output_bytes','started_at','finished_at','poll_retry_count','poll_retry_at',
+                'gpu_reported','gpu_diagnostics',
             }
             for k in transient:
                 data.pop(k,None)

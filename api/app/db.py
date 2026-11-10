@@ -25,6 +25,13 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def utc_isoformat(value: datetime | None) -> str | None:
+    # SQLite drops tzinfo from DateTime columns; all stored timestamps are UTC.
+    if value is None:
+        return None
+    return (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).isoformat()
+
+
 _DISPATCH_LOCK_KEY = int.from_bytes(
     hashlib.sha256(b"colab-gpu-studio:dispatch").digest()[:8], "big", signed=True
 )
@@ -122,8 +129,8 @@ class Store:
             "id": row.id,
             "owner_id": row.owner_id,
             "project_id": row.project_id,
-            "created_at": row.created_at.isoformat() if row.created_at else None,
-            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+            "created_at": utc_isoformat(row.created_at),
+            "updated_at": utc_isoformat(row.updated_at),
         }
         result.update({key: value for key, value in (row.data or {}).items() if key not in reserved})
         if row.state is not None:
@@ -259,19 +266,12 @@ class Store:
                 if acquired:
                     lock.release()
             return
-        import fcntl
+        from .filelocks import file_lock
 
         path = path.with_name(path.name + '.upload.' + key)
         with path.open('a+') as handle:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                yield False
-                return
-            try:
-                yield True
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            with file_lock(handle, blocking=False) as acquired:
+                yield acquired
 
     @contextmanager
     def admission_lock(self, timeout=1.0):
@@ -334,19 +334,12 @@ class Store:
                     lock.release()
             return
         if lock_path is not None:
-            import fcntl
+            from .filelocks import file_lock
 
             lock_path.parent.mkdir(parents=True, exist_ok=True)
             with lock_path.open("a+") as lock_file:
-                try:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    yield False
-                    return
-                try:
-                    yield True
-                finally:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                with file_lock(lock_file, blocking=False) as acquired:
+                    yield acquired
             return
         raise RuntimeError(f"不支持的数据库准入锁方言: {self.engine.dialect.name}")
 
@@ -394,20 +387,18 @@ class Store:
                     lock.release()
             return
         if lock_path is not None:
-            import fcntl
+            from .filelocks import file_lock
 
             lock_path.parent.mkdir(parents=True, exist_ok=True)
             with lock_path.open("a+") as lock_file:
-                try:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    yield False
-                    return
-                try:
-                    self._dispatch_enter()
-                    yield True
-                finally:
-                    self._dispatch_exit()
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                with file_lock(lock_file, blocking=False) as acquired:
+                    if not acquired:
+                        yield False
+                        return
+                    try:
+                        self._dispatch_enter()
+                        yield True
+                    finally:
+                        self._dispatch_exit()
             return
         raise RuntimeError(f"不支持的数据库调度锁方言: {self.engine.dialect.name}")

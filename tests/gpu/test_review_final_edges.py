@@ -102,7 +102,11 @@ def test_deleted_reconciliation_requires_lease_instance_identity_match():
         "remote_deleted": True,
         "remote_delete_source": "cleanup_provider_confirmation",
     }
-    scheduler = Scheduler(object(), instance_service=Service())
+    repo = Repository(Store("sqlite:///:memory:"))
+    repo.create("jobs", "owner", {"state": "completed"}, record_id="job")
+    service = Service()
+    service.list = lambda owner: Service.instances
+    scheduler = Scheduler(repo, instance_service=service)
 
     assert scheduler._reconcile_deleted_lease_instances([lease]) == 0
 

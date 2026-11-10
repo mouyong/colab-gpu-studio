@@ -89,3 +89,68 @@ export function appendActivationLog(log: string[], line: string, maxEntries = 40
   const next = [...log, line];
   return next.length > maxEntries ? next.slice(next.length - maxEntries) : next;
 }
+
+export type ActivationInputSpec = {
+  key: string;
+  label?: string;
+  description?: string;
+  type?: string;
+  required?: boolean;
+};
+
+export function missingActivationInputs(inputs: ActivationInputSpec[], values: Record<string, string>): string[] {
+  return inputs
+    .filter((input) => input.required && !values[input.key])
+    .map((input) => input.label || input.key);
+}
+
+export function activationSmokeParams(inputs: ActivationInputSpec[], values: Record<string, string>): { params: Record<string, string>; assetIds: string[] } {
+  const params: Record<string, string> = {};
+  const assetIds: string[] = [];
+  for (const input of inputs) {
+    const value = values[input.key];
+    if (!value) continue;
+    params[input.key] = value;
+    if (!assetIds.includes(value)) assetIds.push(value);
+  }
+  return { params, assetIds };
+}
+
+export type ActivationWatch = {
+  workflowId: string;
+  projectId: string;
+  jobId: string;
+  state: string;
+  maxRuntimeMinutes: number | null;
+};
+
+const WATCH_KEY = 'studio-activation-watch';
+
+export function readActivationWatch(): Record<string, ActivationWatch> {
+  try {
+    const raw = sessionStorage.getItem(WATCH_KEY);
+    const parsed = raw ? JSON.parse(raw) as unknown : {};
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return parsed as Record<string, ActivationWatch>;
+  } catch {
+    return {};
+  }
+}
+
+export function writeActivationWatch(value: Record<string, ActivationWatch>): void {
+  try { sessionStorage.setItem(WATCH_KEY, JSON.stringify(value)); } catch { /* storage can be unavailable */ }
+}
+
+export function smokeIdempotencyKey(workflowId: string, projectId: string, assetIds: string[]): string {
+  const signature = `${workflowId}:${projectId}:${[...assetIds].sort().join(',')}`;
+  const storageKey = `studio-smoke-idem:${signature}`;
+  try {
+    const existing = sessionStorage.getItem(storageKey);
+    if (existing) return existing;
+    const created = `smoke-${workflowId}-${typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Date.now()}`;
+    sessionStorage.setItem(storageKey, created);
+    return created;
+  } catch {
+    return `smoke-${workflowId}-${Date.now()}`;
+  }
+}

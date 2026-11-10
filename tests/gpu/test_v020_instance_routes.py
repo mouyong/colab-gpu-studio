@@ -17,6 +17,17 @@ class FakeInstanceService:
     def public(self, instance):
         return {**instance, "handle": "do-not-leak", "connection_token": "secret"}
 
+    def get(self, owner, instance_id):
+        row = self.instances.get(instance_id)
+        return row if row and row.get("owner_id") == owner else None
+
+    def list(self, owner, state=None):
+        return [row for row in self.instances.values() if row.get("owner_id") == owner
+                and (state is None or row.get("state") == state)]
+
+    def events(self, owner, instance_id):
+        return []
+
     def retention(self, owner, instance_id, mode, idle_minutes, key, expected_version=None):
         self.calls.append(("retention", owner, instance_id, mode, idle_minutes, key, expected_version))
         row = self.instances[instance_id]

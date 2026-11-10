@@ -10,6 +10,7 @@ class MemoryRepo:
     def __init__(self):
         self.rows = {"workflows": [], "jobs": [], "operations": [], "instances": [], "events": []}
         self.fail_update = None
+        self.store = self  # assets live in the same in-memory table set
 
     def list(self, kind, owner_id=None, project_id=None):
         rows = self.rows.get(kind, [])

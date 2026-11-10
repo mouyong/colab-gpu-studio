@@ -1,5 +1,6 @@
 """Job admission domain service: validate, freeze inputs, estimate and persist."""
 import copy
+import os
 
 from .common import APIError, own
 from .gpu import loras as lora_registry
@@ -35,10 +36,7 @@ def _job_estimate(repo, owner, workflow, policy, cfg, params) -> dict:
 
 def _resource(repo, kind, resource_id, user, code, message):
     """Read a v0.2 resource through the owner-scoped Repository boundary."""
-    try:
-        value = repo.get(kind, resource_id, user["id"])
-    except (AttributeError, KeyError, TypeError, ValueError):
-        value = None
+    value = repo.get(kind, resource_id, user["id"])
     if not value:
         raise APIError(code, message, 404)
     return value
@@ -88,39 +86,28 @@ def _validate_allocation(repo, user, policy: dict) -> dict:
     # Automatic account selection is only allowed to inspect eligible accounts;
     # it must never silently fail over from one identity to another.
     if checked["provider"] == "colab" and not checked.get("account_id"):
-        try:
-            accounts = repo.list("accounts", user["id"])
-        except (AttributeError, KeyError, TypeError, ValueError):
-            accounts = []
-        if accounts and not any(_account_is_usable(item) for item in accounts):
+        accounts = repo.list("accounts", user["id"])
+        usable = [item.get("account_id") or item["id"] for item in accounts if _account_is_usable(item)]
+        if accounts and not usable:
             raise APIError("ACCOUNT_UNAVAILABLE", "没有允许分配且已授权的 Google 账号", 409)
+        # #24: bind the only Colab-connected account before its OAuth status is checked;
+        # with several connected accounts the instance service keeps choosing.
+        connected = [aid for aid in usable if _google_status(repo, user["id"], aid)["colab"]["connected"]]
+        if len(connected) == 1:
+            checked["account_id"] = connected[0]
     return checked
 
 
 def _google_status(repo, owner_id, account_id):
     from .gpu.google import GoogleService
 
-    try:
-        service = GoogleService(repo, owner_id, account_id=account_id)
-    except TypeError:
-        service = GoogleService(repo, owner_id)
-    try:
-        return service.status(account_id=account_id)
-    except TypeError:
-        # GoogleService(repo, owner_id, account_id=...) sets self.account_id
-        # in __init__ and exposes status() without arguments.
-        return service.status()
+    return GoogleService(repo, owner_id, account_id=account_id).status()
 
 
 def _resolve_drive_account_id(repo, owner_id, account_id):
-    if not account_id:
-        return None
-    try:
-        from .gpu.accounts import AccountService
+    from .gpu.accounts import AccountService
 
-        return AccountService(repo, owner_id).resolve_drive_account_id(account_id)
-    except Exception:
-        return account_id
+    return AccountService(repo, owner_id).resolve_drive_account_id(account_id)
 
 
 def admit_job(st, user, body, key, *, validate_only=False):
@@ -140,8 +127,6 @@ def admit_job(st, user, body, key, *, validate_only=False):
     if policy["provider"] == "colab" and not cfg.real_enabled:
         raise APIError("REAL_GPU_DISABLED", "真实 GPU 默认关闭：请先配置 OAuth、费率预算并完成模型审查")
     if policy["provider"] == "colab" and policy["lifecycle"] in {"smart", "retain"}:
-        import os
-
         if os.getenv("GPU_REAL_RETENTION_VERIFIED") != "1" and os.getenv("GPU_REAL_RETENTION_TEST_ENABLED") != "1":
             raise APIError("REAL_LIFECYCLE_UNVERIFIED", "真实 GPU 的智能/保留生命周期尚未完成真机验证", 503)
     workflow = registry.get_workflow(user["id"], body["workflow_key"], body["workflow_version"])

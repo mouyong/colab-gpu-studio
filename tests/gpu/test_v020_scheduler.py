@@ -16,6 +16,13 @@ class FakeInstanceService:
         self.calls = []
         self._next = 0
 
+    def list(self, owner):
+        return [dict(row) for row in self.instances.values()]
+
+    def get(self, owner, instance_id):
+        row = self.instances.get(instance_id)
+        return dict(row) if row else None
+
     def allocate(self, job):
         self.calls.append(("allocate", job["id"]))
         self._next += 1
@@ -62,12 +69,15 @@ class FakeInstanceService:
             instance["state"] = "releasing"
         return dict(instance)
 
-    def mark_deleted(self, owner, instance_id, remote_deleted=False):
+    def mark_deleted(self, owner, instance_id, expected_version=None, remote_deleted=False):
         assert owner == "owner-1"
         assert remote_deleted is True
         self.calls.append(("mark_deleted", instance_id, remote_deleted))
         self.instances[instance_id]["state"] = "deleted"
         return dict(self.instances[instance_id])
+
+    def record_usage(self, owner, payload):
+        self.calls.append(("record_usage", payload["instance_id"]))
 
     def public(self, instance):
         return {k: v for k, v in instance.items() if k != "runtime_name"}

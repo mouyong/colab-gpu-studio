@@ -4,6 +4,7 @@ import { apiMessage, getGpuInstance, setInstanceRetention, stopInstance } from '
 import type { GpuInstance } from './AccountDirectory';
 import { InstanceWorkbench } from './InstanceWorkbench';
 import { formatInstanceTime as formatTime } from '../lib/instance-time';
+import { gpuLabel } from '../lib/gpu-label';
 import styles from './v020.module.css';
 
 type Filter = 'all' | 'active' | 'retained' | 'history';
@@ -200,7 +201,7 @@ export function InstanceCenter({ instances = [], onContinue, onOpenWorkbench, on
         return <article className={styles.instanceCard} key={id}>
           <div className={styles.cardTop}><div className={styles.minWidth}><h3 title={id}>{label(instance)}</h3><p className={styles.muted}>{instance.account_alias_snapshot || (instance.account_id ? `账号 ${shortId(instance.account_id)}` : '账号未确认')} · {instance.provider || '运行时未确认'}</p></div><span className={`${styles.badge} ${instance.state === 'ready' || instance.state === 'busy' || instance.state === 'retained_idle' ? styles.good : ''}`}>{stateLabel(instance.state)}</span></div>
           <div className={styles.detailGrid}>
-            <div className={styles.metaCell}><span>GPU</span><b>{instance.gpu_reported || '未确认'}</b></div>
+            <div className={styles.metaCell}><span>GPU</span><b>{gpuLabel(instance)}</b></div>
             <div className={styles.metaCell}><span>实例 ID</span><b title={id}>{shortId(id)}</b></div>
             <div className={styles.metaCell}><span>当前任务</span><b title={instance.current_job_id || ''}>{instance.current_job_id ? shortId(instance.current_job_id) : '空闲'}</b></div>
             <div className={styles.metaCell}><span>保留截止</span><b>{formatTime(instance.retained_until || instance.idle_deadline_at)}</b></div>

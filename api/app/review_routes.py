@@ -283,6 +283,37 @@ def _runtime_cap(row: Mapping, cfg: GpuConfig) -> int:
     return min(declared, cfg.max_runtime_minutes)
 
 
+def activation_inputs(manifest: Mapping | None) -> list[dict]:
+    """Image slots and other values the smoke cannot fill from a default.
+
+    Optional images stay visible so the operator can attach them, but they are
+    not required. Parameters that already have a default are omitted: the smoke
+    resolver fills those, and asking again would look like the form wiped them.
+    """
+    parameters = manifest.get("parameters") if isinstance(manifest, Mapping) else None
+    if not isinstance(parameters, Mapping):
+        return []
+    rows = []
+    for name, spec in parameters.items():
+        if not isinstance(spec, Mapping):
+            continue
+        kind = str(spec.get("type") or "string")
+        optional_image = kind == "image" and spec.get("required") is False
+        needs_value = "default" not in spec and (kind == "image" or spec.get("required") is True)
+        if kind != "image" and not needs_value:
+            continue
+        rows.append(
+            {
+                "key": str(name),
+                "label": str(spec.get("label") or name),
+                "description": str(spec.get("description") or ""),
+                "type": kind,
+                "required": bool(needs_value and not optional_image),
+            }
+        )
+    return rows
+
+
 def _smoke_compatibility_signature(
     workflow_id: str,
     row: Mapping,
@@ -387,6 +418,39 @@ def _legacy_smoke_identity(job: Mapping) -> dict | None:
     if any(value is None for value in identity.values()):
         return None
     return identity
+
+
+def _smoke_signatures(workflow_id: str, row: Mapping, model: Mapping) -> list[str]:
+    """Fingerprints activation, acceptance and publish must all recognize.
+
+    The queued smoke job is stamped from the reviewed weight list. Reading only
+    the raw manifest misses that job, so the wizard looks idle and a second
+    click is easy to mistake for a failed submit.
+    """
+    signatures: list[str] = []
+    revision = model.get("revision")
+    try:
+        signatures.append(_smoke_compatibility_signature(workflow_id, row, revision))
+    except APIError:
+        pass
+    if row.get("review_approved") is True:
+        try:
+            reviewed = _reviewed_snapshot(row)
+            reviewed_signature = _smoke_compatibility_signature(
+                workflow_id, row, revision, snapshot_parts=reviewed
+            )
+            if reviewed_signature not in signatures:
+                signatures.append(reviewed_signature)
+        except APIError:
+            pass
+    return signatures
+
+
+def _job_matches_any_smoke(job: Mapping, workflow_id: str, row: Mapping, model: Mapping) -> bool:
+    return any(
+        _job_matches_smoke(job, workflow_id, row, model, signature)
+        for signature in _smoke_signatures(workflow_id, row, model)
+    )
 
 
 def _job_matches_smoke(job: Mapping, workflow_id: str, row: Mapping, model: Mapping, current: str) -> bool:
@@ -593,6 +657,8 @@ def real_smoke(
         if asset.get("project_id") != project["id"]:
             raise APIError("ASSET_PROJECT_MISMATCH", "参考素材不属于当前项目")
 
+    cfg = GpuConfig.from_env()
+    runtime = _runtime_cap(row, cfg)
     raw = {
         "project_id": project["id"],
         "model_id": row["model_id"],
@@ -606,7 +672,7 @@ def real_smoke(
             "provider": "colab",
             "account_id": account_id,
             "shutdown_after_job": True,
-            "max_runtime_minutes": 5,
+            "max_runtime_minutes": runtime,
             "idle_grace_minutes": 0,
         },
     }
@@ -627,7 +693,6 @@ def real_smoke(
             202,
         )
 
-    cfg = GpuConfig.from_env()
     if not cfg.real_enabled:
         raise APIError("REAL_GPU_DISABLED", "GPU_REAL_ENABLED尚未启用")
     if cfg.unit_rate is None or cfg.unit_rate <= 0:
@@ -638,8 +703,7 @@ def real_smoke(
     chosen_spec = _eligible_spec(
         GoogleColabProvider(repo, user["id"], account_id=account_id).list_specs(), requested_key
     )
-    # 大模型要先下载权重；声明值仍受服务端全局上限约束。
-    runtime = _runtime_cap(row, cfg)
+    # 大模型要先下载权重；声明值仍受服务端全局上限约束。冒烟上限与步骤标签、任务记录使用同一个数。
     estimated = runtime * cfg.unit_rate  # budget worst case
     picked = mode_param(row["manifest"])
     shown, rate = estimate_units(repo, user["id"], row["workflow_key"], row["manifest"], chosen_spec.get("key"), runtime,
@@ -722,9 +786,34 @@ def real_smoke(
                 job["id"],
                 user["id"],
                 "queued",
-                "已通过人工审查并排队真实模型冒烟；最长以 manifest 声明的分钟数为限，完成后立即释放GPU",
+                f"已进入队列，最长 {runtime} 分钟，完成后立即释放 GPU",
             )
     return _smoke_response(job, request, resumed=not created)
+
+
+def _prepare_account_ids(repo, owner_id, requested_account_id):
+    """Bind cache preparation to an owned compute account and its Drive account."""
+    from .gpu.accounts import AccountService
+
+    accounts = AccountService(repo, owner_id)
+    account_id = requested_account_id
+    if account_id is None:
+        choices = [row for row in accounts.list() if row.get("enabled", True)
+                   and row.get("allow_allocation")
+                   and row.get("authorization", {}).get("colab", {}).get("connected")]
+        if len(choices) != 1:
+            raise APIError("ACCOUNT_REQUIRED", "缓存准备需要明确选择Google账号", 422)
+        account_id = choices[0]["account_id"]
+    if not isinstance(account_id, str) or not account_id.strip():
+        raise APIError("ACCOUNT_INVALID", "account_id必须为非空字符串", 422)
+    account_id = account_id.strip()
+    _require_account(repo, owner_id, account_id)
+    if not GoogleService(repo, owner_id, account_id=account_id).status().get("colab", {}).get("connected"):
+        raise APIError("GOOGLE_NOT_CONNECTED", "所选账号尚未完成Colab OAuth授权")
+    drive_account_id = accounts.resolve_drive_account_id(account_id)
+    if not GoogleService(repo, owner_id, account_id=drive_account_id).status().get("drive", {}).get("connected"):
+        raise APIError("DRIVE_NOT_CONNECTED", "所选存储账号尚未完成Drive OAuth授权")
+    return account_id, drive_account_id
 
 
 @router.post("/workflows/{workflow_id}/prepare")
@@ -741,8 +830,7 @@ def prepare_workflow(
     cfg = GpuConfig.from_env()
     if not cfg.real_enabled:
         raise APIError("REAL_GPU_DISABLED", "GPU_REAL_ENABLED尚未启用")
-    if not GoogleService(repo, user["id"]).status().get("colab", {}).get("connected"):
-        raise APIError("GOOGLE_NOT_CONNECTED", "请先完成个人Colab OAuth授权")
+    account_id, drive_account_id = _prepare_account_ids(repo, user["id"], body.get("account_id"))
     project_id = body.get("project_id")
     if not isinstance(project_id, str):
         raise APIError("VALIDATION_ERROR", "project_id必填")
@@ -752,8 +840,10 @@ def prepare_workflow(
         "model_id": row["model_id"],
         "workflow_key": row["workflow_key"],
         "workflow_version": row["workflow_version"],
+        "account_id": account_id,
+        "drive_account_id": drive_account_id,
     }
-    key = prep_idempotency_key(row.get("sha256") or workflow_id, _idempotency_key(request))
+    key = prep_idempotency_key(row.get("sha256") or workflow_id, account_id + ":" + _idempotency_key(request))
     with st.dispatch_lock() as acquired:
         if not acquired:
             raise APIError("SCHEDULER_BUSY", "调度正在同步，请稍后用相同幂等键重试", 503, True)
@@ -841,8 +931,7 @@ def accept_smoke(
         raise APIError("SMOKE_NOT_COMPLETE", "只能验收已完成的服务器真实工作流冒烟任务")
     if job.get("target_workflow_id") != workflow_id or job.get("target_model_id") != row.get("model_id"):
         raise APIError("SMOKE_TARGET_MISMATCH", "冒烟任务目标与当前工作流/模型不匹配")
-    current_signature = _smoke_compatibility_signature(workflow_id, row, model.get("revision"))
-    if not _job_matches_smoke(job, workflow_id, row, model, current_signature):
+    if not _job_matches_any_smoke(job, workflow_id, row, model):
         raise APIError("SMOKE_TARGET_MISMATCH", "冒烟任务证据与当前工作流artifact不匹配")
     output_ids = job.get("output_asset_ids")
     if not isinstance(output_ids, list) or not output_ids:
@@ -933,19 +1022,12 @@ def workflow_activation(
         runtime_error = exc.message
     else:
         runtime_error = None
-    current_signature = None
-    if model is not None:
-        try:
-            current_signature = _smoke_compatibility_signature(workflow_id, row, model.get("revision"))
-        except APIError:
-            current_signature = None
     jobs = [
         job
         for job in repo.list("jobs", user["id"])
         if _job_snapshot(job).get("workflow_smoke") is True
         and model is not None
-        and current_signature is not None
-        and _job_matches_smoke(job, workflow_id, row, model, current_signature)
+        and _job_matches_any_smoke(job, workflow_id, row, model)
     ]
 
     def job_priority(job):
@@ -1009,7 +1091,7 @@ def workflow_activation(
         {"key": "workflow_review", "label": "锁定权重与节点", "done": reviewed},
         {
             "key": "real_smoke",
-            "label": f"真实 GPU 冒烟（≤{runtime_cap or 5} 分钟）",
+            "label": "真实 GPU 冒烟" if runtime_cap is None else f"真实 GPU 冒烟（≤{runtime_cap} 分钟）",
             "done": smoke_done or smoke_completed,
             "running": smoke_state in {"queued", "running"},
             "failed": smoke_state == "failed",
@@ -1046,12 +1128,15 @@ def workflow_activation(
             if smoke is None
             else {
                 "job_id": smoke.get("id"),
+                "project_id": smoke.get("project_id"),
                 "state": smoke_state,
                 "error_code": smoke.get("error_code"),
                 "error_message": smoke.get("error_message"),
                 "acceptance_state": smoke_acceptance_state,
+                "max_runtime_minutes": smoke.get("max_runtime_minutes") or runtime_cap,
                 "reusable": bool(smoke_state in {"queued", "running", "completed"} and not smoke_accepted),
             },
+            "required_inputs": activation_inputs(row.get("manifest")),
             "smoke_job_completed": smoke_completed,
             "smoke_kind": row.get("smoke_test_kind"),
             "real_enabled": bool(cfg.real_enabled),

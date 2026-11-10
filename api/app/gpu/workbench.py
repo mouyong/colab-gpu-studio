@@ -97,31 +97,7 @@ class _OperationLedger:
         ).hexdigest()
 
     def _load(self, owner: str, instance_id: str, action: str, key: str):
-        if self.repo is None or not hasattr(self.repo, "get"):
-            raise WorkbenchError("OPERATION_STORE_UNAVAILABLE", "工作台幂等存储尚未接入", 503, True)
-        operation_id = self._id(owner, instance_id, action, key)
-        try:
-            row = self.repo.get("operations", operation_id, owner)
-        except (AttributeError, TypeError):
-            # Small offline repositories may only expose list().  The production
-            # Repository supports deterministic record IDs, so this is not its path.
-            rows = self.repo.list("operations", owner)
-            row = next((row for row in rows if row.get("id") == operation_id), None)
-        if row is not None:
-            return row
-        # A minimal injected repository may not support deterministic record IDs;
-        # the identity fields still make its persisted row restart-readable.
-        rows = self.repo.list("operations", owner)
-        return next(
-            (
-                item
-                for item in rows
-                if item.get("instance_id") == instance_id
-                and item.get("action") == action
-                and item.get("key") == key
-            ),
-            None,
-        )
+        return self.repo.get("operations", self._id(owner, instance_id, action, key), owner)
 
     def existing(self, owner: str, instance_id: str, action: str, key: str, body: Mapping):
         body_hash = self.digest(body)
@@ -145,11 +121,8 @@ class _OperationLedger:
         with self._lock:
             try:
                 self.repo.create("operations", owner, data, record_id=operation_id)
-            except TypeError:
-                # Compatibility for a minimal injected repository; persistent
-                # repositories should implement record_id for cross-process dedupe.
-                self.repo.create("operations", owner, data)
             except ValueError:
+                # Another process stored the same key first.
                 existing = self._load(owner, instance_id, action, key)
                 if not existing:
                     raise
@@ -161,10 +134,8 @@ class _OperationLedger:
 class WorkbenchService:
     """Controlled workbench with a deterministic mock backend.
 
-    ``repo`` is intentionally duck-typed so the service can be used by the
-    existing Repository and by a small in-memory offline repository.  A trusted
-    real adapter may be supplied by the server, but it is never selected from
-    a client-provided URL.
+    A trusted real adapter may be supplied by the server, but it is never
+    selected from a client-provided URL.
     """
 
     def __init__(self, repo=None, *, registry=None, admit_job=None, trusted_mcp=None, clock=None):
@@ -184,10 +155,8 @@ class WorkbenchService:
         return instance.get("state") in {"unknown", "deleted", "releasing", "cleanup_pending", "quarantined"}
 
     def _rows(self, kind: str, owner: str):
-        if self.repo is None:
-            return []
-        source = self.repo.store if kind == "assets" and hasattr(self.repo, "store") else self.repo
-        return list(source.list(kind, owner))
+        source = self.repo.store if kind == "assets" else self.repo
+        return source.list(kind, owner)
 
     def _workflows(self, owner: str, *, include_drafts: bool = False):
         rows = self.registry.workflows(owner) if self.registry is not None else self._rows("workflows", owner)
@@ -238,12 +207,8 @@ class WorkbenchService:
     def _write_draft(self, owner, instance, workflow, params, bound_graph):
         identity = f"{workflow['workflow_key']}@{workflow['workflow_version']}"
         value = {"params": copy.deepcopy(params), "bound_graph": copy.deepcopy(bound_graph), "draft": True}
-        if self.repo is None or not hasattr(self.repo, "update"):
-            raise WorkbenchError("DRAFT_PERSISTENCE_UNAVAILABLE", "工作台草稿存储尚未接入", 503, True)
-        persisted = self.repo.get("instances", instance["id"], owner) if hasattr(self.repo, "get") else None
-        source = persisted if isinstance(persisted, Mapping) else instance
-        current = source.get("workbench_drafts") if isinstance(source, Mapping) else None
-        drafts = dict(current) if isinstance(current, Mapping) else {}
+        persisted = self.repo.get("instances", instance["id"], owner) or instance
+        drafts = dict(persisted.get("workbench_drafts") or {})
         drafts[identity] = value
         self.repo.update("instances", instance["id"], {"workbench_drafts": drafts}, owner)
         return copy.deepcopy(value)
@@ -594,20 +559,9 @@ class WorkbenchService:
     def _draft_values(self, owner, instance):
         if instance.get("owner_id") not in (None, owner):
             return {}
-        source = instance
-        if self.repo is not None and hasattr(self.repo, "get"):
-            persisted = self.repo.get("instances", instance.get("id"), owner)
-            if isinstance(persisted, Mapping):
-                source = persisted
-        raw = source.get("workbench_drafts") if isinstance(source, Mapping) else None
-        if not isinstance(raw, Mapping):
-            return {}
-        result = {}
-        for identity, draft in raw.items():
-            params = draft.get("params") if isinstance(draft, Mapping) else draft
-            if isinstance(params, Mapping):
-                result[str(identity)] = self._safe_public_value(params)
-        return result
+        source = self.repo.get("instances", instance.get("id"), owner) or instance
+        drafts = source.get("workbench_drafts") or {}
+        return {identity: self._safe_public_value(draft["params"]) for identity, draft in drafts.items()}
 
     @staticmethod
     def _safe_artifact(asset: Mapping, job_id: str):
@@ -864,8 +818,6 @@ class WorkbenchService:
         self._mock_or_unverified(instance)
         job = self._find_job(owner, instance, payload)
         if self._is_mock(instance):
-            if self.repo is None or not hasattr(self.repo, "update"):
-                raise WorkbenchError("QUEUE_UNAVAILABLE", "实例队列服务未接入", 503, True)
             self.repo.update(
                 "jobs",
                 job["id"],

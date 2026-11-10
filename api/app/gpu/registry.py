@@ -290,12 +290,7 @@ class Registry:
             # eventually reaches Registry, so a module-level import cycles.
             from .. import review_routes
 
-            current_signature = review_routes._smoke_compatibility_signature(
-                id, row, model.get("revision")
-            )
-            if not review_routes._job_matches_smoke(
-                smoke_job, id, row, model, current_signature
-            ):
+            if not review_routes._job_matches_any_smoke(smoke_job, id, row, model):
                 raise ValueError("真实smoke证据与当前workflow artifact不匹配")
             classes = {
                 node.get("class_type") for node in row.get("api_graph", {}).values() if isinstance(node, dict)
@@ -315,3 +310,14 @@ class Registry:
             if sibling.get("workflow_key") == key and sibling.get("active"):
                 self.repo.update("workflows", sibling["id"], {"active": False}, owner_id)
         return self.repo.update("workflows", target["id"], {"active": True}, owner_id)
+
+    def deactivate(self, owner_id, workflow_id):
+        """Stop using a published version as the default. In-flight jobs stay untouched."""
+        row = self.repo.get("workflows", workflow_id, owner_id)
+        if row is None:
+            raise KeyError(workflow_id)
+        if row.get("state") != "published":
+            raise ValueError("只能停用已发布的工作流版本")
+        if not row.get("active"):
+            return row
+        return self.repo.update("workflows", workflow_id, {"active": False}, owner_id)

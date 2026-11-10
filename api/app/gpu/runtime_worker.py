@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
-import fcntl
+import csv
 import hashlib
 import importlib.metadata
 import io
@@ -94,7 +94,30 @@ def _atomic_json(path: Path, value: Any) -> None:
 
 
 def _status(root: Path, state: str, **fields: Any) -> None:
+    # Later stage updates keep the measured GPU so the coordinator can still poll it.
+    path = root / "status.json"
+    if "gpu_diagnostics" not in fields and path.exists():
+        previous = json.loads(path.read_text(encoding="utf-8")).get("gpu_diagnostics")
+        if previous:
+            fields["gpu_diagnostics"] = previous
     _atomic_json(root / "status.json", {"state": state, "updated_at": time.time(), **fields})
+
+
+def _probe_gpu() -> dict | None:
+    """Read the allocated device, independently of the requested Colab spec."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, check=True, timeout=10,
+        )
+        devices = [
+            {"name": name.strip(), "memory_mib": int(memory)}
+            for name, memory in csv.reader(result.stdout.splitlines())
+        ]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        # Device reporting is informational and must never stop generation.
+        return None
+    return {"source": "runtime_nvidia_smi", "captured_at": time.time(), "devices": devices} if devices else None
 
 
 def _instance_service_name(instance_id: str) -> str:
@@ -127,6 +150,10 @@ def _comfy_service_dir(instance_id: str) -> Path:
 @contextlib.contextmanager
 def _file_lock(path: Path):
     """Serialize worker-local service management without trusting a PID lock."""
+    # Service management runs in the Linux runtime; coordinators also import
+    # this module for the fixed worker protocol on Windows.
+    import fcntl
+
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with path.open("a+") as stream:
         fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
@@ -1354,6 +1381,10 @@ def run_job(payload: dict, root: Path, *, artifact_store=None) -> None:
     try:
         _status(root, "running")
         snapshot, manifest, graph = _snapshot(payload)
+        if snapshot.get("prep") is not True:
+            diagnostics = _probe_gpu()
+            if diagnostics:
+                _status(root, "running", gpu_diagnostics=diagnostics)
         if snapshot.get("system_smoke") is True:
             if manifest.get("executor") != "cuda-smoke":
                 raise WorkerError("system smoke requires the cuda-smoke executor manifest")

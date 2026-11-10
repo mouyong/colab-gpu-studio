@@ -16,14 +16,9 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from .compute import ProviderUnavailable
+
 log = logging.getLogger(__name__)
-
-try:
-    from .compute import ProviderUnavailable
-except ImportError:  # independent adapter can be imported before compute lands
-
-    class ProviderUnavailable(RuntimeError):
-        pass
 
 
 class ComfyError(ProviderUnavailable):

@@ -1,6 +1,6 @@
 name: colab-gpu-studio
 x-studio: &studio
-  image: colab-gpu-studio:0.2.13
+  image: colab-gpu-studio:0.3.0
   build: .
   env_file: .env
   environment:

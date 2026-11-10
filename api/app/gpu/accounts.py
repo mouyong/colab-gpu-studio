@@ -66,16 +66,11 @@ class AccountService:
         return hashlib.sha256(raw).hexdigest()
 
     def _rows(self, kind: str) -> list[dict]:
-        try:
-            return [row for row in self.repo.list(kind, self.owner_id) if isinstance(row, dict)]
-        except (AttributeError, KeyError, TypeError, ValueError):
-            return []
+        return self.repo.list(kind, self.owner_id)
 
     def _get(self, account_id: str) -> dict | None:
-        try:
-            return self.repo.get("accounts", account_id, self.owner_id)
-        except (AttributeError, KeyError, TypeError, ValueError):
-            return next((row for row in self._rows("accounts") if row.get("id") == account_id or row.get("account_id") == account_id), None)
+        # Account records use the account id as their row id.
+        return self.repo.get("accounts", account_id, self.owner_id)
 
     def _operation(self, key: str | None, body: Any) -> dict | None:
         if not key:
@@ -105,9 +100,8 @@ class AccountService:
         }
         try:
             self.repo.create("operations", self.owner_id, data, record_id=hashlib.sha256(f"{self.owner_id}:{key}".encode()).hexdigest())
-        except TypeError:
-            self.repo.create("operations", self.owner_id, data)
         except ValueError:
+            # A concurrent request with the same key won the insert; return its result.
             existing = self._operation(key, body)
             if existing is not None:
                 return existing
@@ -141,18 +135,13 @@ class AccountService:
             }
             try:
                 self.repo.create("accounts", self.owner_id, data, record_id=account_id)
-            except TypeError:
-                self.repo.create("accounts", self.owner_id, data)
             except ValueError:
-                pass
+                pass  # created by a concurrent request
         # Migration is exact and local: it never exchanges or invents tokens.
         for kind in ("credentials", "jobs", "leases", "instances", "executions", "files"):
             for row in self._rows(kind):
                 if row.get("account_id") in (None, ""):
-                    try:
-                        self.repo.update(kind, row["id"], {"account_id": account_id}, self.owner_id)
-                    except (AttributeError, KeyError, TypeError, ValueError):
-                        continue
+                    self.repo.update(kind, row["id"], {"account_id": account_id}, self.owner_id)
 
     @staticmethod
     def _clean_text(value: Any, limit: int, default: str = "") -> str:
@@ -289,14 +278,11 @@ class AccountService:
             "budget": body.get("budget") if isinstance(body.get("budget"), dict) else {},
             "strategy": self._clean_text(body.get("strategy"), 32, "manual"),
         }
-        try:
-            self.repo.create("accounts", self.owner_id, data, record_id=account_id)
-        except TypeError:
-            self.repo.create("accounts", self.owner_id, data)
+        self.repo.create("accounts", self.owner_id, data, record_id=account_id)
         return self._save_operation(idempotency_key, body, self._public(data), operation="create")
 
     def update(self, account_id: str, body: dict, idempotency_key: str | None = None) -> dict:
-        row = self.require(account_id)
+        self.require(account_id)
         existing = self._operation(idempotency_key, {"account_id": account_id, **(body or {})})
         if existing is not None:
             return existing
@@ -317,7 +303,7 @@ class AccountService:
             raise APIError("VALIDATION_ERROR", "workflows必须为数组", 422)
         if "drive_account_id" in patch:
             patch["drive_account_id"], _ = self._validate_drive_account(patch["drive_account_id"], self_account_id=account_id)
-        updated = self.repo.update("accounts", row.get("id", account_id), patch, self.owner_id)
+        updated = self.repo.update("accounts", account_id, patch, self.owner_id)
         return self._save_operation(idempotency_key, {"account_id": account_id, **body}, self._public(updated), operation="update")
 
     def disconnect(self, account_id: str, idempotency_key: str | None = None, body: dict | None = None) -> dict:
