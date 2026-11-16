@@ -245,7 +245,7 @@ def workbench_action(instance_id: str, body: WorkbenchActionInput, request: Requ
 def workflow_graph_preview(
     workflow_key: str,
     request: Request,
-    version: int,
+    version: str,
     draft: bool = False,
     user=Depends(current_user),
 ):

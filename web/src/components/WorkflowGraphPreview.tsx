@@ -143,14 +143,18 @@ export function WorkflowGraphPreview({ workflow, loadPreview, onClose }: Workflo
   const [selected, setSelected] = useState('');
   const [error, setError] = useState('');
 
+  // 父组件每次刷新都会传一个新的 loadPreview；只在换工作流时重新读取，
+  // 否则会在「读取中」和结果之间来回闪（#31）。
+  const loadRef = useRef(loadPreview);
+  loadRef.current = loadPreview;
   useEffect(() => {
     let alive = true;
     setData(null); setError(''); setTab('ui'); setPan({ x: 0, y: 0, scale: 1 }); setSelected('');
-    loadPreview().then((next) => { if (alive) setData(next); }).catch((cause: unknown) => {
+    loadRef.current().then((next) => { if (alive) setData(next); }).catch((cause: unknown) => {
       if (alive) setError(cause instanceof Error ? cause.message : '读取工作流预览失败');
     });
     return () => { alive = false; };
-  }, [loadPreview]);
+  }, [workflow.workflow_key, workflow.workflow_version]);
 
   const uiGraph = useMemo(() => data && data.ui_graph ? normalisePreviewGraph(data.ui_graph, 'ui') : null, [data]);
   const apiGraph = useMemo(() => data && data.api_graph ? normalisePreviewGraph(data.api_graph, 'api') : null, [data]);

@@ -372,6 +372,21 @@ class Scheduler:
             return job
         return self._merge_instance(job, instance)
 
+    def _close_unstarted_instance(self, job: dict, lease: dict) -> dict:
+        """任务在创建运行时之前就失败时，远端没有机器可删，实例直接收尾。
+
+        否则实例会一直停在「释放中」，看起来像失败后还在继续跑。
+        """
+        if not self._is_v020_job(job) or not job.get("instance_id"):
+            return job
+        if lease.get("handle") or int(lease.get("create_attempts") or 0):
+            return job
+        instance = self._service_instance_for_job(job)
+        if not instance or instance.get("state") != "releasing" or instance.get("lease_id") not in (None, lease["id"]):
+            return job
+        instance = self._instance_call("mark_deleted", job.get("owner_id"), job["instance_id"], confirmed=True)
+        return self._merge_instance(job, instance)
+
     def _factory(self, factory: Callable, job: dict):
         """Injected adapters take ``job`` and optionally the base Store."""
         import inspect
@@ -1380,6 +1395,7 @@ class Scheduler:
         if not lease:
             return self._finish_cleanup(job, final_state, "GPU cleanup completed")
         if lease.get("state") == "deleted":
+            job = self._close_unstarted_instance(job, lease)
             self._record_usage(job, lease, self.clock())
             return self._finish_cleanup(job, final_state, "GPU cleanup completed")
         next_epoch = float(lease.get("cleanup_next_epoch") or 0)

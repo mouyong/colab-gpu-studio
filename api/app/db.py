@@ -15,7 +15,7 @@ from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import JSON, DateTime, String, create_engine, select, text
+from sqlalchemy import JSON, DateTime, String, create_engine, event, select, text
 from sqlalchemy import delete as sql_delete
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -83,6 +83,11 @@ MODELS.update(
 )
 
 
+def _sqlite_wal(connection, _record) -> None:
+    """WAL 让读不挡写，多个后台循环并发时少很多锁冲突。"""
+    connection.execute("PRAGMA journal_mode=WAL")
+
+
 class Store:
     MODELS = MODELS
 
@@ -90,19 +95,33 @@ class Store:
         self.url = url or os.environ.get("DATABASE_URL", "sqlite:///./colab-gpu-studio.db")
         if self.url.startswith("sqlite:///") and not self.url.endswith(":memory:"):
             Path(self.url.removeprefix("sqlite:///")).expanduser().parent.mkdir(parents=True, exist_ok=True)
-        connect_args = {"check_same_thread": False} if self.url.startswith("sqlite") else {}
+        # 调度器、看门狗和接口会同时写 SQLite；默认 5 秒锁等待太短，
+        # 会直接抛 OperationalError（database is locked）让任务失败（#30）。
+        connect_args = {"check_same_thread": False, "timeout": 30} if self.url.startswith("sqlite") else {}
         kwargs = {"pool_pre_ping": True}
         if self.url in {"sqlite:///:memory:", "sqlite://"}:
             kwargs["poolclass"] = StaticPool
         self._memory_lock = threading.RLock()
         self._dispatch_state = threading.local()
         self.engine = create_engine(self.url, connect_args=connect_args, **kwargs)
+        if self.engine.dialect.name == "sqlite" and self.engine.url.database not in {None, "", ":memory:"}:
+            event.listen(self.engine, "connect", _sqlite_wal)
         self.Session = sessionmaker(self.engine, expire_on_commit=False, class_=Session)
         self.create_all()
 
     def create_all(self) -> None:
-        with self.db_lock():
-            Base.metadata.create_all(self.engine)
+        lock = self._sqlite_dispatch_lock_path()
+        if lock is None:
+            with self.db_lock():
+                Base.metadata.create_all(self.engine)
+            return
+        # 启动器会同时拉起 API 和 worker 两个进程；首次启动时两边一起建表，
+        # 后到的一方会报 table already exists，所以建表要跨进程串行。
+        from .filelocks import file_lock
+
+        with lock.with_name(lock.name.replace(".dispatch.lock", ".schema.lock")).open("a+") as handle:
+            with file_lock(handle):
+                Base.metadata.create_all(self.engine)
 
     @contextmanager
     def db_lock(self):

@@ -3,11 +3,12 @@ import { Zap, Search, RefreshCw, Image as ImageIcon, Film, Loader, ChevronRight,
 import { type GpuJob } from '../lib/gpu-api';
 import styles from '../gpu.module.css';
 import { formatDateTime, jobSize, progressPercent, readableState, terminalStates } from '../lib/ui-helpers';
-import { jobStageLabel } from '../lib/job-stage-rows';
+import { jobStageLabel, jobStateLabel } from '../lib/job-stage-rows';
 import { canRetainJobInstance, gpuLabel } from '../lib/gpu-label';
 
-const RUNNING = ['running', 'uploading', 'saving', 'active', 'started', 'creating', 'reserved', 'validating', 'cleanup_pending'];
-const WAITING = ['queued', 'pending', 'preparing'];
+// 与后端 scheduler.ACTIVE_STATES 对应：前四个算排队，后面算运行。
+const WAITING = ['queued', 'validating', 'waiting_for_capacity', 'allocating'];
+const RUNNING = ['preparing', 'loading', 'running', 'uploading', 'cleaning_up', 'cleanup_pending'];
 const DONE = ['completed', 'succeeded'];
 const FAILED = ['failed', 'failed_final', 'cancelled', 'cancelled_local', 'blocked'];
 
@@ -31,7 +32,7 @@ export function TasksPanel({
   const [limit, setLimit] = useState(30);
 
   const stateOf = (job: GpuJob) => String(job.state || 'queued').toLowerCase();
-  const isActive = (job: GpuJob) => RUNNING.includes(stateOf(job)) || WAITING.includes(stateOf(job));
+  const isActive = (job: GpuJob) => !terminalStates.has(stateOf(job));
   const uniqueJobs = useMemo(() => {
     const seen = new Set<string>();
     return jobs.filter((job, index) => {
@@ -83,7 +84,7 @@ export function TasksPanel({
         </div>
         <select aria-label="按状态筛选" className={styles.miniSelect} value={['all', 'running', 'completed'].includes(filter) ? '' : filter} onChange={(e) => setFilter(e.target.value || 'all')}>
           <option value="">更多状态</option>
-          {[...new Set(uniqueJobs.map((job) => job.state || 'queued'))].map((state) => <option value={state} key={state}>{readableState(state)}</option>)}
+          {[...new Set(uniqueJobs.map((job) => job.state || 'queued'))].map((state) => <option value={state} key={state}>{jobStateLabel(state)}</option>)}
         </select>
       </div>
 
@@ -129,7 +130,7 @@ export function TasksPanel({
                   <div className={styles.jobInfo}>
                     <div className={styles.jobTitleRow}>
                       <strong title={job.workflow_key || job.id}>{job.workflow_key || `任务 ${job.id.slice(0, 8)}`}</strong>
-                      <span className={`pill ${done ? 'solid' : failed ? 'danger' : ''}`}>{readableState(job.state)}</span>
+                      <span className={`pill ${done ? 'solid' : failed ? 'danger' : ''}`}>{jobStateLabel(job.state)}</span>
                     </div>
                     <p className="muted small">
                       {[video ? '视频' : '图片', size, job.provider === 'mock' ? '模拟' : job.provider === 'colab' ? 'Colab' : ''].filter(Boolean).join(' · ')}

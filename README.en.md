@@ -1,6 +1,6 @@
 **English** | [简体中文](README.md)
 
-> Current version: 0.3.0. Defensive code cleanup and #24 fixes. See the [0.3.0 release notes](#030-release-notes) below and the [offline implementation notes](docs/OFFLINE_IMPLEMENTATION.md).
+> Current version: 0.3.1. Fixes #27, #29, #30 and #31. See [0.3.1](#031) and the [0.3.0 release notes](#030-release-notes) below and the [offline implementation notes](docs/OFFLINE_IMPLEMENTATION.md).
 
 # Colab GPU Studio
 
@@ -10,8 +10,8 @@ The frontend is a React single-page app optimized for mobile touch controls, and
 
 ## Downloads and Online Demo
 
-- **Latest version**: [0.3.0 release](https://github.com/TizenryA/colab-gpu-studio/releases/tag/v0.3.0) (source + release notes).
-- **Prebuilt multi-platform bundles**: the [0.3.0 release assets](https://github.com/TizenryA/colab-gpu-studio/releases/tag/v0.3.0) ship Windows x86_64 / Linux x86_64 / macOS x64 / macOS arm64 / Android Termux packages. Desktop bundles include Python and dependencies; Termux installs its native dependencies online at first launch; checksums are in `SHA256SUMS.txt`.
+- **Latest version**: [0.3.1 release](https://github.com/TizenryA/colab-gpu-studio/releases/tag/v0.3.1) (source + release notes).
+- **Prebuilt multi-platform bundles**: the [0.3.1 release assets](https://github.com/TizenryA/colab-gpu-studio/releases/tag/v0.3.1) ship Windows x86_64 / Linux x86_64 / macOS x64 / macOS arm64 / Android Termux packages. Desktop bundles include Python and dependencies; Termux installs its native dependencies online at first launch; checksums are in `SHA256SUMS.txt`.
 - **Read-only UI demo**: [Open the Cloudflare Workers demo](https://gpu-colab-studio-demo.tizenry.tech). Public demo password: `demo-readonly`.
 - The demo uses the **original 0.1.31-dev.8 frontend** with a separate Mock data snapshot. It does not connect to the production site, Google, or a real GPU, and does not consume CU. Generation, uploads, edits, deletion, and authorization are unavailable; download and self-host the full version for complete functionality.
 - [Demo details and more screenshots](docs/DEMO.md). The screenshots below were captured in a real browser on the live demo site; they are not design mockups.
@@ -26,6 +26,25 @@ The frontend is a React single-page app optimized for mobile touch controls, and
 ![Desktop creation page](docs/demo/screenshots/desktop-create.png)
 
 </details>
+
+## 0.3.1
+
+Small bug-fix release, no data migration.
+
+- **#29** Job list shows Chinese labels for every backend state (e.g. `waiting_for_capacity` → 等待算力), and the "in progress" count includes queued / waiting / allocating jobs.
+- **#30** If a job fails before a runtime is created, its instance is closed as released instead of staying "releasing" forever. File SQLite now uses WAL with a 30 s lock wait to reduce `OperationalError` (database is locked).
+- **#31** The offline workflow preview loads once per workflow instead of reloading on every page refresh, and text versions like `1.0.0` no longer return a 422.
+- **First start** On a fresh database the API and worker no longer race to create tables (`table already exists`); schema creation is serialized across processes.
+- **#27** Windows frontend tests convert the file URL with `fileURLToPath` (thanks @CyrusAuyeung, PR #28).
+
+**Downloads**
+
+- [Colab-GPU-Studio-v0.3.1-windows-x86_64.zip](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.1/Colab-GPU-Studio-v0.3.1-windows-x86_64.zip)
+- [Colab-GPU-Studio-v0.3.1-linux-x86_64.tar.gz](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.1/Colab-GPU-Studio-v0.3.1-linux-x86_64.tar.gz)
+- [Colab-GPU-Studio-v0.3.1-macos-x86_64.tar.gz](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.1/Colab-GPU-Studio-v0.3.1-macos-x86_64.tar.gz)
+- [Colab-GPU-Studio-v0.3.1-macos-arm64.tar.gz](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.1/Colab-GPU-Studio-v0.3.1-macos-arm64.tar.gz)
+- [Colab-GPU-Studio-v0.3.1-android-termux.zip](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.1/Colab-GPU-Studio-v0.3.1-android-termux.zip)
+- [SHA256SUMS.txt](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.1/SHA256SUMS.txt)
 
 ## 0.3.0 Release Notes
 

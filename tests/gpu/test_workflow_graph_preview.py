@@ -163,6 +163,15 @@ def test_reviewed_graph_preview_is_owner_scoped_and_does_not_need_instance():
     assert getattr(exc.value, "code", None) == "WORKFLOW_UNPUBLISHED"
 
 
+def test_graph_preview_matches_text_version_from_query():
+    repo = PreviewRepo()
+    repo.rows["workflows"][0]["workflow_version"] = "1.0.0"
+    service = WorkbenchService(repo=repo)
+    assert service.get_reviewed_graph("owner", {"workflow_key": "offline-demo", "workflow_version": "1.0.0"})["reviewed"] is True
+    repo.rows["workflows"][0]["workflow_version"] = 1
+    assert service.get_reviewed_graph("owner", {"workflow_key": "offline-demo", "workflow_version": "1"})["reviewed"] is True
+
+
 def test_draft_graph_preview_is_owner_scoped_and_read_only():
     repo = PreviewRepo()
     repo.rows["workflows"].append({
@@ -189,7 +198,7 @@ def test_workflow_preview_route_uses_authenticated_owner_and_version():
     class PreviewWorkbench:
         def get_reviewed_graph(self, owner, payload):
             assert owner == "owner"
-            assert payload == {"workflow_key": "offline-demo", "workflow_version": 1, "allow_draft": False}
+            assert payload == {"workflow_key": "offline-demo", "workflow_version": "1.0.0", "allow_draft": False}
             return {"workflow_key": "offline-demo", "workflow_version": 1, "api_graph": {}}
 
     app = FastAPI()
@@ -203,7 +212,8 @@ def test_workflow_preview_route_uses_authenticated_owner_and_version():
     app.include_router(router)
 
     with TestClient(app) as client:
-        response = client.get("/api/gpu/workflows/offline-demo/preview?version=1")
+        # #31：版本号是 "1.0.0" 这类字符串时不能返回 422。
+        response = client.get("/api/gpu/workflows/offline-demo/preview?version=1.0.0")
 
     assert response.status_code == 200
     assert response.json()["data"]["workflow_key"] == "offline-demo"

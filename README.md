@@ -1,6 +1,6 @@
 **简体中文** | [English](README.en.md)
 
-> 当前版本 0.3.0：清理防御性代码，修复 #24。详见下方 [0.3.0 发布说明](#030-发布说明)；离线/Mock 验收记录见 [离线实施记录](docs/OFFLINE_IMPLEMENTATION.md)。
+> 当前版本 0.3.1：修复 #27、#29、#30、#31。详见下方 [0.3.1 更新](#031-更新) 和 [0.3.0 发布说明](#030-发布说明)；离线/Mock 验收记录见 [离线实施记录](docs/OFFLINE_IMPLEMENTATION.md)。
 
 # Colab GPU Studio
 
@@ -10,8 +10,8 @@
 
 ## 下载与在线演示
 
-- **最新版本**：[0.3.0 Release](https://github.com/TizenryA/colab-gpu-studio/releases/tag/v0.3.0)（源码 + 更新说明）。
-- **预编译多平台独立包**：[0.3.0 Release 附件](https://github.com/TizenryA/colab-gpu-studio/releases/tag/v0.3.0) 提供 Windows x86_64 / Linux x86_64 / macOS x64 / macOS arm64 / Android Termux 五个包；桌面包内置 Python 和依赖，Termux 包首次启动需联网安装原生依赖；SHA-256 见附件里的 `SHA256SUMS.txt`。
+- **最新版本**：[0.3.1 Release](https://github.com/TizenryA/colab-gpu-studio/releases/tag/v0.3.1)（源码 + 更新说明）。
+- **预编译多平台独立包**：[0.3.1 Release 附件](https://github.com/TizenryA/colab-gpu-studio/releases/tag/v0.3.1) 提供 Windows x86_64 / Linux x86_64 / macOS x64 / macOS arm64 / Android Termux 五个包；桌面包内置 Python 和依赖，Termux 包首次启动需联网安装原生依赖；SHA-256 见附件里的 `SHA256SUMS.txt`。
 - **只读界面演示**：[打开 Cloudflare Workers 演示站](https://gpu-colab-studio-demo.tizenry.tech)。公开演示密码：`demo-readonly`。
 - 演示站使用 **0.1.31-dev.8 原版前端**，展示独立的 Mock 数据快照，不连接生产站、Google 或真实 GPU，不消耗 CU。生成、上传、修改、删除和授权均不可用；完整功能请下载后自行部署。
 - [演示说明与更多截图](docs/DEMO.md)。以下截图来自线上演示站的实际浏览器，不是设计稿。
@@ -26,6 +26,27 @@
 ![桌面创作页](docs/demo/screenshots/desktop-create.png)
 
 </details>
+
+## 0.3.1 更新
+
+小修复版本，不需要数据迁移。
+
+- **#29 任务列表状态**：`waiting_for_capacity` 等后端状态现在显示中文（如「等待算力」），「进行中」计数也把排队、等算力、分配中的任务算进去。
+- **#30 失败后实例一直「释放中」**：任务在创建运行时之前就失败时，实例直接收尾为「已释放」，不再停在「释放中」。同时 SQLite 改用 WAL 并把锁等待放宽到 30 秒，减少并发写入时的 `OperationalError`（database is locked）。
+- **#31 工作流离线预览来回闪**：预览只在切换工作流时读取一次，不再随页面刷新反复重读；版本号是 `1.0.0` 这类字符串时也能正常打开，不再报「请求格式错误」。
+- **首次启动建表冲突**：启动器同时拉起 API 和 worker，全新数据库上两边一起建表时可能报 `table already exists` 退出，现在建表跨进程串行。
+- **#27 Windows 前端测试**：测试入口用 `fileURLToPath` 转换路径（感谢 @CyrusAuyeung，PR #28）。
+
+完整说明见 [0.3.1 更新说明](docs/RELEASE_NOTES_0.3.1.md)。
+
+**下载**
+
+- [Colab-GPU-Studio-v0.3.1-windows-x86_64.zip](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.1/Colab-GPU-Studio-v0.3.1-windows-x86_64.zip)
+- [Colab-GPU-Studio-v0.3.1-linux-x86_64.tar.gz](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.1/Colab-GPU-Studio-v0.3.1-linux-x86_64.tar.gz)
+- [Colab-GPU-Studio-v0.3.1-macos-x86_64.tar.gz](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.1/Colab-GPU-Studio-v0.3.1-macos-x86_64.tar.gz)
+- [Colab-GPU-Studio-v0.3.1-macos-arm64.tar.gz](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.1/Colab-GPU-Studio-v0.3.1-macos-arm64.tar.gz)
+- [Colab-GPU-Studio-v0.3.1-android-termux.zip](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.1/Colab-GPU-Studio-v0.3.1-android-termux.zip)
+- [SHA256SUMS.txt](https://github.com/TizenryA/colab-gpu-studio/releases/download/v0.3.1/SHA256SUMS.txt)
 
 ## 0.3.0 发布说明
 

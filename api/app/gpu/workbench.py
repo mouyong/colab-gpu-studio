@@ -178,8 +178,9 @@ class WorkbenchService:
                     return row
             raise WorkbenchError("WORKFLOW_UNPUBLISHED", "工作流未发布或不属于当前用户", 409)
         key, version = self._workflow_identity(payload)
+        # 版本可能是整数（注册表自增）也可能是 "1.0.0" 这类字符串，按文本比较。
         for row in self._workflows(owner, include_drafts=include_drafts):
-            if row.get("workflow_key") == key and row.get("workflow_version") == version:
+            if row.get("workflow_key") == key and str(row.get("workflow_version")) == str(version):
                 return row
         raise WorkbenchError("WORKFLOW_UNPUBLISHED", "工作流未发布或不属于当前用户", 409)
 

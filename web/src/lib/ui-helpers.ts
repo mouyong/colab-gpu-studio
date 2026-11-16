@@ -75,6 +75,8 @@ export function readableState(value?: string) {
         creating: '创建运行时', reserved: '已预留', active: '运行时已启动', started: '已启动',
         uploading: '上传中', running: '运行中', saving: '保存中', cleanup_pending: '清理中',
         deleted: '已释放', quarantined: '已隔离', completed: '已完成', succeeded: '已完成',
+        requested: '申请中', allocating: '分配中', ready: '空闲', idle: '空闲', busy: '运行任务中',
+        retained_idle: '保留中', releasing: '释放中', deleting: '释放中', unknown: '状态未知',
         failed: '失败', failed_final: '最终失败', cancelled: '已取消', cancelled_local: '已取消', blocked: '已阻止',
       }[value] || value)
     : '未知';
